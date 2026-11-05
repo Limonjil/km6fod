@@ -1,0 +1,6 @@
+id=km6fod
+name=KM6 Under-Display Fingerprint (AIDL HAL)
+version=v1.2.0
+versionCode=12000
+author=clean-room
+description=Silead GSL7002 under-display fingerprint for the Tecno Spark 40 Pro (KM6) on GSI. Self-contained AIDL HAL built from AOSP android17 AIDL v5, verified panel HBM with readback, kernel full-HBM uevent injection, touch coordinates, lazy sensor open, serialized vendor calls, and a supervisor that resets HBM if the HAL dies. Runs from the device's own vendor library, patched at boot after verifying the patch site. Checked on Android 15 / 4 KB / Magisk 31.1; Android 16-17 is built for but not verified, KernelSU and APatch are not supported.

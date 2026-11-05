@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.km6.suiudfps"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="35" android:targetSdkVersion="35" />
+
+    <!--
+      Supplies SystemUI's pixel_pitch for the under-display sensor.
+
+      The GSI reports -1.0 for this dimension, and UdfpsOverlayInteractor then
+      refuses to compute the sensor geometry ("invalid pixelPitch: -1.0"), which
+      shows up as a misplaced white shape drawn over the fingerprint icon on the
+      lock screen. 0.0654 mm is the pixel pitch of this 6.78" 1080x2400 panel.
+    -->
+    <overlay android:targetPackage="com.android.systemui"
+             android:priority="30"
+             android:isStatic="true" />
+
+    <application android:hasCode="false" />
+</manifest>

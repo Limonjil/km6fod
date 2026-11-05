@@ -1,0 +1,8 @@
+backups/
+build/
+dist/
+review/
+debug-evidence/
+debug-evidence$T-*
+*.log
+.metrics/

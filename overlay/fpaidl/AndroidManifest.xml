@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.km6.fpaidl"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="35" android:targetSdkVersion="35" />
+
+    <!--
+      Clears config_biometric_sensors.
+
+      AuthService decides which fingerprint code path system_server uses from
+      this array (frameworks/base .../biometrics/AuthService.java):
+
+          new FingerprintSensorConfigurations(
+                  !(hidlConfigStrings != null && hidlConfigStrings.length > 0));
+
+      A non-empty array therefore forces the legacy HIDL branch, which wraps
+      every sensor in HidlToAidlSensorAdapter and looks for a HIDL
+      IBiometricsFingerprint daemon. On this GSI the array is populated by
+      com.mediatek.frameworkresoverlay and android.auto_generated_rro_product__,
+      so the framework never takes the AIDL path even though the AIDL HAL is
+      registered ; the resulting stuck FingerprintUpdateActiveUserClient is
+      what hides the fingerprint entry in Settings.
+
+      An empty array flips the decision to the AIDL branch.
+    -->
+    <overlay android:targetPackage="android" android:priority="100" android:isStatic="true" />
+
+    <application android:hasCode="false" />
+</manifest>

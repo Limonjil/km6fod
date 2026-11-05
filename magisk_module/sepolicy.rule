@@ -1,0 +1,17 @@
+allow hal_fingerprint_default magisk unix_stream_socket connectto
+allow magisk hal_fingerprint_default unix_stream_socket connectto
+allow magisk hal_fingerprint_default fd use
+allow magisk hal_fingerprint_default unix_stream_socket read
+allow magisk hal_fingerprint_default unix_stream_socket write
+allow magisk hal_fingerprint_default unix_stream_socket getattr
+
+# Trustonic TEE user node. The vendor engine opens /dev/mobicore-user to bring up
+# the Silead TA; without it the TA command table stays unpopulated and enroll()
+# fails immediately with HW_UNAVAILABLE (-1009). The stock HAL ran in
+# hal_fingerprint_default, which already had this permission; a Magisk-launched
+# process is in the `magisk` domain and needs it granted explicitly.
+allow magisk mobicore_user_device chr_file { ioctl read write getattr open }
+
+# Kernel-object uevent injection: the gate the vendor engine blocks on
+# (TRAN_FULL_HBM_EVENT=FULL_HBM_SET). Without it the sensor never captures.
+allow magisk magisk netlink_kobject_uevent_socket { create bind setopt read write sendto }
