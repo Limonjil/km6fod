@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 //
 // ISession implementation.
 //
@@ -49,6 +49,10 @@
 
 namespace km6fod {
 
+// Creates the HAL's virtual KEY_WAKEUP device ahead of the first press, because
+// inputflinger opens new devices asynchronously and drops early events.
+void wakeKeyInit();
+
 class Session : public aidl::android::hardware::biometrics::fingerprint::BnSession {
   public:
     using AuthToken = aidl::android::hardware::keymaster::HardwareAuthToken;
@@ -73,7 +77,7 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
 
     void onEngineMessage(const EngineMessage& message);
 
-    // FOD wake gesture (EV_KEY 0xbe) from the touch controller. This is the only
+    // FOD wake gesture (EV_KEY 0xbe or 0xb7) from the touch controller. This is the only
     // notification available while the panel is off, so it drives both the
     // display wake-up and the illumination window.
     void onFodKey(bool down);
@@ -89,6 +93,8 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
 
     // ---- IFingerprint.ISession ------------------------------------------
     ::ndk::ScopedAStatus generateChallenge() override;
+    // The worker half of generateChallenge(), after the calibration settle.
+    void finishChallenge();
     ::ndk::ScopedAStatus revokeChallenge(int64_t in_challenge) override;
     ::ndk::ScopedAStatus enroll(
         const AuthToken& in_hat,
@@ -130,6 +136,11 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
 
     static constexpr uint32_t kEnrollTimeoutSeconds = 60;
     static constexpr int kOperationTimeoutMs = 60000;
+    // Enrollment is twenty separate captures with the finger lifted in between,
+    // and AOSP itself gives the enroll client no deadline (timeoutSec = 0). A
+    // 60 s budget fired in the middle of a normal enrollment and closed the
+    // operation with TIMEOUT, which the user sees as the sensor giving up.
+    static constexpr int kEnrollOperationTimeoutMs = 180000;
     static constexpr int kCancelEscalationMs = 3000;
     static constexpr int kRearmThrottleMs = 500;
     static constexpr int kEnumerateQuietMs = 400;
@@ -140,14 +151,16 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
     // of the group switch, and that command replaces the TA's enroll challenge.
     // Measured on hardware: calibration completes ~200 ms after the switch, but
     // the margin is kept generous because a failed enroll costs a full retry.
-    static constexpr int kCalibrationSettleUs = 2500 * 1000;
+    // times, on the timer queue instead of on the serial worker (review H-12).
+    static constexpr int kCalibrationSettleMs = 2500;
 
     // Opening the HBM window right after the display wakes is racy: the panel
     // driver ignores the write while it still considers the display idle, the
     // readback stays 0xFA and the capture would be aborted. Retrying briefly
     // covers the wake-up ramp instead of failing an authentication attempt.
-    static constexpr int kHbmArmAttempts = 4;
-    static constexpr int kHbmArmRetryUs = 80 * 1000;
+    // One attempt plus one deferred retry covers the ramp without ever sleeping
+    // on the callback dispatcher (review H-12/H-33).
+    static constexpr int kHbmArmRetryMs = 80;
 
     // How long to wait for the fingerprint overlay after waking a dark screen,
     // and the polling step. SystemUI needs roughly 200-400 ms to draw it; waiting
@@ -165,20 +178,24 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
     bool isCurrent(uint64_t generation, State state) const;
     uint64_t beginOperation(State state);
     bool finishOperation(uint64_t generation, bool close_hbm);
-    void failOperation(uint64_t generation, FingerprintError error, int32_t vendor_code);
-    void postTerminalError(FingerprintError error, int32_t vendor_code, uint64_t epoch);
+    void failOperation(uint64_t generation, FingerprintError error);
+    void postTerminalError(FingerprintError error, uint64_t epoch);
     void cancelOperation(uint64_t generation);
     void timeoutOperation(uint64_t generation);
 
     // ---- worker-side actions --------------------------------------------
     void runEnroll(uint64_t generation, AuthToken hat);
     void runAuthenticate(uint64_t generation, int64_t operation_id);
-    bool armCapture(uint64_t generation, State expected, bool open_window);
+    bool armCapture(uint64_t generation, State expected);
 
     // Opens the panel illumination window on demand (first touch of an
     // authentication). Returns false when the panel refused to become bright.
-    // Applies the HBM window. Returns once the panel is verified bright.
     bool armIllumination(bool allow_wake);
+
+    // The single requestOn() attempt and the guards around it; no retry here.
+    bool tryArmIllumination();
+    // Puts that one retry on the timer queue (review H-12/H-33).
+    void scheduleIlluminationRetry();
 
     // Schedules armIllumination() on the dispatcher. The touch reader must never
     // block on the panel: it is the only thread reading the finger, and a stalled
@@ -197,6 +214,8 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
     bool postToWorker(std::function<void()> action);
     // The FOD press body: vendor work plus a bounded wait for the overlay.
     void armFodPress();
+    // The part of the press that needs the display up, after the timer wait.
+    void continueFodPress();
     // Ends a deferred gesture release once the hold window expired (timer-driven).
     void finishGestureRelease(uint64_t token);
     // One step of the "wait for the framework overlay" poll (timer-driven).
@@ -206,6 +225,8 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
     void requestRearm(uint64_t generation);
     void startEnumerate();
     void runEnumerate(uint64_t generation);
+    // Timer-driven flush of the enumeration buffer (review H-12).
+    void enumerateSettle(uint64_t generation);
     void finishEnumerate(uint64_t generation, std::vector<int32_t> ids,
                          bool authoritative);
 
@@ -216,7 +237,7 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
     bool checkCallback(::ndk::ScopedAStatus status, const char* what);
     void handleDeadCallback();
     bool emitChallengeGenerated(int64_t challenge);
-    bool emitError(FingerprintError error, int32_t vendor_code);
+    bool emitError(FingerprintError error);
     bool emitAcquired(int32_t engine_code);
     bool emitEnrollmentProgress(int32_t id, int32_t remaining);
     bool emitAuthenticationSucceeded(int32_t id, const AuthToken& token);
@@ -258,10 +279,17 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
     // produce "no match", and counting them as failed attempts locked the sensor.
     std::atomic<bool> frame_good_{false};
 
-    // Authoritative template id from the last enumerate() (only when exactly one
-    // template exists). Used instead of inventing an id when the engine reports a
-    // non-positive one.
     std::atomic<int64_t> last_touch_ms_{0};
+
+    // When the last press started on a dark panel and woke it: the overlay icon is
+    // drawn by SystemUI ~1.4 s after the wake, far outside the capture budget, so
+    // such a press is captured as soon as the panel is actually lit instead of
+    // waiting for the icon.
+    std::atomic<int64_t> dark_wake_ms_{0};
+
+    // Authoritative template id: from the last enumerate() when exactly one
+    // template exists, otherwise from the last enrollment step. Always a value the
+    // framework accepts (never negative); -1 means "nothing known in this boot".
     std::atomic<int32_t> single_template_id_{-1};
 
     // Authentication defers the illumination window until a finger actually
@@ -294,6 +322,8 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
     // One arm in flight at a time; a second request while one runs is dropped
     // because requestOn() is idempotent for an open window anyway.
     std::atomic<bool> arm_in_flight_{false};
+    // One deferred illumination retry at a time (review H-12).
+    std::atomic<bool> illumination_retry_{false};
     // One overlay wait at a time: the branch that handles touches without an
     // overlay fires for every sample, but only one of them may wait.
     std::atomic<bool> overlay_wait_active_{false};
@@ -306,10 +336,6 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
     // Anchor for the staleness check. Without it a session that never saw a plain
     // touch kept up_at == 0, which disabled the check entirely (review H-09).
     std::atomic<int64_t> op_started_ms_{0};
-    // A non-empty enumeration seen since boot. A later "0 templates" answer from
-    // the engine is then treated as a failure instead of an authoritative wipe:
-    // the framework deletes the enrollment when it is told the list is empty.
-    std::atomic<bool> saw_templates_{false};
     std::atomic<int32_t> last_touch_x_{0};
     std::atomic<int32_t> last_touch_y_{0};
 
@@ -361,15 +387,16 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
 
     // Enumeration is accumulated and flushed once, because AIDL delivers the
     // complete template list in a single callback. The quiet window absorbs
-    // notices that the engine emits asynchronously after enumerate() returns.
+    // notices that the engine emits asynchronously after enumerate() returns;
+    // it is driven by the timer queue so the serial worker is never parked for
+    // it (review H-12).
     mutable std::mutex enum_mutex_;
-    std::condition_variable enum_cv_;
     std::vector<int32_t> enumerated_;
     bool enum_active_ = false;
     bool enum_error_ = false;
-    bool enum_dirty_ = false;
+    int64_t enum_started_ms_ = 0;
+    int64_t enum_last_notice_ms_ = 0;
     uint64_t enum_generation_ = 0;
-
     std::weak_ptr<Session> self_;
 };
 

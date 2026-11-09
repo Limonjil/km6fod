@@ -8,6 +8,9 @@
 # patch on a perfectly good vendor build - which is exactly what happened on the
 # device at 2026-11-04 02:41.
 #
+# The same file-bytes rule applies to the trampoline cave: its code is checked
+# against the reference artifact at the file offset.
+#
 # Runs on the host: no device, no NDK, no build. Assert-based, no framework.
 #
 set -euo pipefail
@@ -26,18 +29,24 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 OFFSET_HEX="$(sed -n 's/^PATCH_OFFSET=\$((\(0x[0-9a-fA-F]*\)))$/\1/p' "$SCRIPT")"
 BEFORE="$(sed -n 's/^PATCH_BEFORE="\([0-9a-fA-F]*\)".*/\1/p' "$SCRIPT")"
 AFTER="$(sed -n 's/^PATCH_AFTER="\([0-9a-fA-F]*\)".*/\1/p' "$SCRIPT")"
+CAVE_OFFSET_HEX="$(sed -n 's/^CAVE_OFFSET=\$((\(0x[0-9a-fA-F]*\))).*/\1/p' "$SCRIPT")"
+CAVE_AFTER="$(sed -n 's/^CAVE_AFTER="\([0-9a-fA-F]*\)".*/\1/p' "$SCRIPT")"
 
 [ -n "$OFFSET_HEX" ] || fail "PATCH_OFFSET not found in post-fs-data.sh"
 [ -n "$BEFORE" ] || fail "PATCH_BEFORE not found in post-fs-data.sh"
 [ -n "$AFTER" ] || fail "PATCH_AFTER not found in post-fs-data.sh"
+[ -n "$CAVE_OFFSET_HEX" ] || fail "CAVE_OFFSET not found in post-fs-data.sh"
+[ -n "$CAVE_AFTER" ] || fail "CAVE_AFTER not found in post-fs-data.sh"
 
 OFFSET=$((OFFSET_HEX))
+CAVE_OFFSET=$((CAVE_OFFSET_HEX))
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cp "$REF" "$TMP/lib.so"
 
-hex_at() { od -An -tx1 -j "$2" -N 4 "$1" | tr -d ' \n'; }
+hex_at() { od -An -v -tx1 -j "$2" -N 4 "$1" | tr -d ' \n'; }
+hex_range() { od -An -v -tx1 -j "$2" -N "$3" "$1" | tr -d ' \n'; }
 
 # 1. The reference artifact is the patched one: the site must read PATCH_AFTER.
 got="$(hex_at "$TMP/lib.so" "$OFFSET")"
@@ -49,10 +58,15 @@ printf '\040\002\370\067' | dd of="$TMP/lib.so" bs=1 seek="$OFFSET" conv=notrunc
 got="$(hex_at "$TMP/lib.so" "$OFFSET")"
 [ "$got" = "$BEFORE" ] || fail "original word reads '$got', PATCH_BEFORE is '$BEFORE'"
 
-# 3. Applying the patch bytes must produce exactly PATCH_AFTER (NOP).
-printf '\037\040\003\325' | dd of="$TMP/lib.so" bs=1 seek="$OFFSET" conv=notrunc 2>/dev/null
+# 3. Applying the patch bytes from the script must produce exactly PATCH_AFTER.
+printf '%b' "$(echo "$AFTER" | sed 's/../\\x&/g')" | \
+    dd of="$TMP/lib.so" bs=1 seek="$OFFSET" conv=notrunc 2>/dev/null
 got="$(hex_at "$TMP/lib.so" "$OFFSET")"
 [ "$got" = "$AFTER" ] || fail "patched word reads '$got', PATCH_AFTER is '$AFTER'"
 
-echo "PASS: site 0x$(printf %x "$OFFSET"): $BEFORE -> $AFTER"
+# 4. The reference artifact must carry the cave code the script writes there.
+got="$(hex_range "$TMP/lib.so" "$CAVE_OFFSET" $((${#CAVE_AFTER} / 2)))"
+[ "$got" = "$CAVE_AFTER" ] || fail "cave reads '$got', CAVE_AFTER is '$CAVE_AFTER'"
+
+echo "PASS: site 0x$(printf %x "$OFFSET"): $BEFORE -> $AFTER, cave verified"
 echo "      (byte order checked against od, not against the instruction word)"

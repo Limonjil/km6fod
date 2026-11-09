@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 //
 // Panel high-brightness (HBM) control for the under-display sensor.
 //

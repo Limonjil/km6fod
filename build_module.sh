@@ -31,7 +31,6 @@ bash "$ROOT/build.sh"
 echo "== staging module payload"
 mkdir -p "$MODULE/files"
 cp -f "$ROOT/build/fp_hal" "$MODULE/files/fp_hal"
-cp -f "$ROOT/build/trantp_probe" "$MODULE/files/trantp_probe"
 if [ -f "$ROOT/patched/libsl_fp_impl.so" ]; then
     echo "warning: patched/libsl_fp_impl.so is present but is no longer packaged;" >&2
     echo "         the module now transforms the device's own library at boot." >&2
@@ -74,7 +73,6 @@ skip_ext = (".log", ".pid", ".tmp", ".lock", ".sh~")
 
 MODE = {
     "files/fp_hal": 0o755,
-    "files/trantp_probe": 0o755,
     "post-fs-data.sh": 0o755,
     "service.sh": 0o755,
     "uninstall.sh": 0o755,
@@ -95,7 +93,7 @@ def sha256(path):
     return h.hexdigest()
 
 
-for name in ("fp_hal", "trantp_probe"):
+for name in ("fp_hal",):
     built = os.path.join(build_dir, name)
     staged = os.path.join(root, "files", name)
     if not os.path.isfile(built):

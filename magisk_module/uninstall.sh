@@ -7,9 +7,7 @@
 # otherwise it would restart fp_hal immediately after this script kills it.
 
 MODDIR=${0%/*}
-# The HAL owns /data/adb/km6fod/run (lock, hold_off, templates marker). Both sides
-# must agree on it: writing hold_off to the module directory meant the HAL's signal
-# went into a directory the helper never read (review H-32).
+# One runtime directory, owned by the HAL; every script must use it (review H-32).
 RUN="/data/adb/km6fod/run"
 PIDFILE="$RUN/fp_hal.pid"
 SUPERVISOR_LOCK="$RUN/supervisor.lock"

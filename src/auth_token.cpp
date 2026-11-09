@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 
 #include "auth_token.h"
 
@@ -68,10 +68,10 @@ bool isAuthTokenPlausible(const uint8_t in[kAuthTokenSize]) {
     if (raw.version != 0) {
         return false;
     }
-    // The HMAC is the cryptographic proof of a successful authentication.
-    // An all-zero MAC is never a valid token, even if the identity fields are
-    // populated. Failing closed here prevents an engine bug from being
-    // forwarded to the framework as an unlock.
+    // Cheap sanity gate only: a token with a zero MAC or a non-zero version is
+    // certainly garbage and must not be forwarded to the framework as an unlock.
+    // This is NOT a cryptographic check - the HMAC is verified by the TA that
+    // produced it; here we only reject the all-zero "engine did nothing" case.
     for (uint8_t byte : raw.hmac) {
         if (byte != 0) {
             return true;

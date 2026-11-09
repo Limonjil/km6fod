@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 //
 // Thin, strongly-typed proxy over the Transsion/Silead vendor fingerprint
 // engine.
@@ -33,6 +33,7 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -50,6 +51,8 @@ class VendorEngine {
     // Opens the sensor once. Safe to call from any thread; returns false when
     // the vendor library or the sensor node is unavailable. Installs the
     // notification callback and applies the default template group on success.
+    // A caller that arrives while an attempt is in flight waits for its outcome
+    // instead of opening the module a second time (review H-23).
     bool open();
 
     // Releases the sensor. Nested calls are tolerated. Does not dlclose.
@@ -72,7 +75,6 @@ class VendorEngine {
     // (SIFP_IOC_WAKELOCK on /dev/silead_fp -> tran_fp -> do_wakeup_set). This is
     // the stock path: the panel is woken by the kernel, not by an injected key.
     bool wakeSystem();
-
 
     // Pushes touch coordinates into the sensor (silfp_impl_set_touch_info).
     // Returns the vendor status: 0 means accepted.
@@ -139,6 +141,17 @@ class VendorEngine {
     }
 
     bool loadEngineSymbolsLocked();
+
+    // The slow half of open(): dlopen, the vendor open() and the two setup
+    // slots. Runs without open_mutex_ so that isOpen() and the notify paths are
+    // not parked behind the vendor call.
+    bool openDevice();
+
+    enum class OpenState { kClosed, kOpening, kOpen };
+    std::mutex open_mutex_;
+    std::condition_variable open_cv_;
+    OpenState open_state_ = OpenState::kClosed;
+    uint64_t open_epoch_ = 0;
 
     mutable std::shared_mutex device_mutex_;
     std::mutex call_mutex_;

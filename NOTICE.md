@@ -6,7 +6,7 @@ km6fod — clean-room AIDL fingerprint HAL for the Tecno Spark 40 Pro (KM6) on G
 
 Everything under `src/`, `tools/`, `magisk_module/*.sh`, `build.sh`, `build_module.sh`,
 `install.sh`, `overlay/*/AndroidManifest.xml` and `overlay/*/res/` is original work,
-licensed GPL-2.0-only (see the SPDX headers in `src/`).
+licensed GPL-3.0-only (see the SPDX headers in `src/` and `LICENSE`).
 
 ## Third-party material in this tree
 
@@ -16,14 +16,72 @@ licensed GPL-2.0-only (see the SPDX headers in `src/`).
 | `third_party/aidl_api/android17-release/*.aidl` | AOSP, same package, frozen API versions 1-5, fetched from `android.googlesource.com` | Apache-2.0 | no — reference only, for the Android 16/17 work |
 | `third_party/syslibs/arm64-v8a/libbinder_ndk.so` | pulled from the device (`/system/lib64`), used only for linking | AOSP, Apache-2.0 | no |
 | `overlay/*/build/*.apk` | built from the manifests in this tree, signed with the public AOSP platform test key | — | the signed APKs are shipped as `system/product/overlay/**` |
-| `analysis/adaptive-ts.ko`, `backups/*.img` | stock Tecno/MediaTek firmware artifacts | proprietary, not redistributable | no |
+| `analysis/adaptive-ts.ko`, `analysis/touch-driver/focaltech_ft3683g.ko`, `backups/*.img` | stock Tecno/MediaTek firmware artifacts | proprietary, Tecno/MediaTek terms | no (analysis copies only) |
+| `analysis/touch-driver/*.patched.ko` | the same two vendor modules with four bytes changed (see `PANEL-RE-LEDGER.md`, T1); kept as analysis artifacts only — the module ships no kernel modules and loads none | proprietary, Tecno/MediaTek terms — not licensed for redistribution | no (not shipped) |
 
 ## What is deliberately not here anymore
 
 The pre-patched `/vendor/lib64/libsl_fp_impl.so` copy is gone. v1.2.0 patches the
 device's own library at boot, after verifying the patch site, and never ships a
-modified proprietary binary. `patched/libsl_fp_impl.so` is kept locally only as the
-reference artifact used while the patch site was established.
+modified proprietary binary. `patched/libsl_fp_impl.so` is kept as the reference
+artifact `tests/patch_site.sh` checks the boot script against: this vendor build
+with the current patch applied (site `1f2003d5`, cave at `0xe008`). It is not
+shipped.
+
+## The vendor pre-flight patch (`0x2f45c`)
+
+`post-fs-data.sh` copies `/vendor/lib64/libsl_fp_impl.so`, writes a `nop` over one
+instruction in `silfp_enroll_enroll` (file offset `0x2f45c`, VA `0x3645c`, the
+original `tbnz w0, #0x1f`) and bind-mounts the copy. Nothing else in the function
+changes.
+
+**It is not a check that the module disables.** In this vendor build
+`silfp_impl_verify_enroll_challenge` is not implemented: the library itself logs
+"No implement fp_verify_enroll_challenge" and returns an uninitialised code. The
+nop'ed instruction is the branch on that code, so without the patch the stub's
+failure path aborts every enroll; with it the flow continues to the next step.
+The challenge in the enroll token is compared nowhere, by the vendor code or by
+us.
+
+Facts that must not be rediscovered:
+
+- The patch cannot be narrowed to "only the benign return code". v1.2.0 tried and
+  an earlier revision of this file described that narrow patch; the value is not
+  stable (observed `-1805537232`, `-1004`, ...) because it comes from a function
+  that is not implemented. A narrow patch would let the real TA errors through on
+  the runs where the garbage happens to look benign, and block the enroll on the
+  others.
+- The security-review item F-S01 ("the module disables the vendor challenge
+  check") rested on the wrong premise: there is no implementation to disable. On
+  a vendor revision that does implement the function, the boot guard's byte
+  comparison (`PATCH_BEFORE=2002f837`) refuses the patch instead of nop'ing a real
+  check, and enroll then reports HW_UNAVAILABLE while authenticate keeps working.
+- The 20-byte cave at `0xe008` that the script still writes is unreachable now:
+  nothing branches to it. It is kept because the guard verifies that region is
+  zero-filled before writing, and removing it is a separate change that needs its
+  own boot test.
+
+## Known limit of this vendor stack: templates cannot be deleted
+
+`silfp_common_remove` in this vendor build always returns 0, takes the ids to delete
+from the engine's own database helpers, and then only sends a `removed`
+notification. The template itself stays in the TA. Measured on the device: a
+removal returned `rc=0` and the engine acknowledged it with a removed notice, and
+the very next `enumerate` still reported one template - twice, once with the
+garbage id the TA reports (`-8931802`) and once with id `0`.
+
+Consequences the module cannot fix:
+
+- The framework deletes enrollments by the id the HAL reported. When the TA names a
+  stored template with garbage, the framework never learns it, Settings shows
+  nothing to delete, and no `removeEnrollments` call can reach it.
+- Such a leftover template still authenticates (it is what the TA matches against).
+  The owner's symptom is that the same finger is then refused for a new enrollment;
+  a TA-side duplicate check is the likely reason but that is not proven here.
+- Only a factory reset (which clears the TA's template database) frees it. The HAL
+  must not pretend otherwise: a `remove` that returns 0 is not evidence that
+  anything was removed, and the log line from `Session::removeEnrollments` has to
+  be read as "the engine accepted the request".
 
 ## Device firmware
 

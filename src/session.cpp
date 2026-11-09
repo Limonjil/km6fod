@@ -1,14 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 
 #include "session.h"
 
-#include "paths.h"
 #include "sensor_geometry.h"
 
 #include <android/binder_auto_utils.h>
 
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <linux/uinput.h>
 #include <csignal>
 #include <mutex>
 #include <unistd.h>
@@ -119,26 +120,6 @@ fp::AcquiredInfo mapEngineAcquired(int32_t engine_code) {
 constexpr int64_t kWakeDebounceMs = 120;
 std::atomic<int64_t> g_last_wake_ms{0};
 
-// Puts the controller back into gesture mode. The touch driver keeps its
-// per-gesture enable bit only while it is powered; after a suspend cycle that
-// bit can end up cleared, and the gesture is then recognised and thrown away
-// ("Sorry, this gesture has been disabled"). Re-applying it when the display
-// goes to sleep is cheap and keeps every wake armed.
-void rearmGestureMode() {
-    // The working path is the procfs node: the vendor service maps its ITrantp
-    // command to /proc/nvt_selftest, which the kernel rejects ("Invalid value!
-    // count = 3"), while /proc/gesture_function really reaches the driver
-    // (dmesg: gesture_data_write code1[be] enable[1]). A plain write, no process.
-    const int fd = ::open("/proc/gesture_function", O_WRONLY | O_CLOEXEC);
-    if (fd < 0) {
-        return;
-    }
-    const ssize_t written = ::write(fd, "fp1\n", 4);
-    ::close(fd);
-    if (written == 4) {
-        LOGD("wake: gesture re-armed via /proc/gesture_function");
-    }
-}
 
 // The framework opens the authenticate operation about 1.3 s after the display
 // comes up (measured: pre-light 25.124 -> authenticate 26.402). Illumination must
@@ -150,25 +131,6 @@ bool wakeInFlight() {
     return t != 0 && monotonicMs() - t < 2500;
 }
 
-// A real wake has to go through the platform's own wake path: only then does
-// SystemUI draw the keyguard and its fingerprint overlay, and only then does the
-// framework create the authenticate operation the capture needs. A display
-// wakelock lights the panel but leaves SystemUI in its dozing bookkeeping, so the
-// operation never arrives (measured: 12 wakes, "overlay did not appear", state=0).
-void injectWakeKey() {
-    static std::once_flag once;
-    std::call_once(once, [] { ::signal(SIGCHLD, SIG_IGN); });
-    const pid_t pid = ::fork();
-    if (pid == 0) {
-        ::execl("/system/bin/input", "input", "keyevent", "224", static_cast<char*>(nullptr));
-        ::_exit(127);
-    }
-    if (pid < 0) {
-        // The wake silently did not happen; without this the stall looked like a
-        // dead sensor (review H-34).
-        LOGE("session: cannot inject the wake key: fork failed (%s)", std::strerror(errno));
-    }
-}
 
 // 100 ms cache: the wake decision does not need better resolution, and the reader
 // calls it on every idle sample.
@@ -186,6 +148,72 @@ int cachedBacklightLevel() {
     return level;
 }
 
+// A virtual KEY_WAKEUP device owned by the HAL. The vendor wakelock
+// (do_wakeup_set) keeps the SoC awake but does not make the display interactive,
+// and SystemUI creates the authenticate operation only for an interactive
+// display. Forking /system/bin/input does not work from this process: the cmd
+// binder transaction fails with "Failed transaction (2147483646)", while the
+// same command succeeds from a root shell.
+int wakeKeyFd() {
+    static std::atomic<int> fd{-1};
+    const int cached_fd = fd.load(std::memory_order_acquire);
+    if (cached_fd >= 0) {
+        return cached_fd;
+    }
+    const int created = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    if (created < 0) {
+        LOGW("wake: /dev/uinput open failed: %s", strerror(errno));
+        return -1;
+    }
+    if (ioctl(created, UI_SET_EVBIT, EV_KEY) < 0 ||
+        ioctl(created, UI_SET_KEYBIT, KEY_WAKEUP) < 0) {
+        LOGW("wake: uinput capability setup failed: %s", strerror(errno));
+        close(created);
+        return -1;
+    }
+    uinput_setup setup{};
+    setup.id.bustype = BUS_VIRTUAL;
+    setup.id.vendor = 0x6b36;
+    setup.id.product = 1;
+    snprintf(setup.name, sizeof(setup.name), "km6fod-wake");
+    if (ioctl(created, UI_DEV_SETUP, &setup) < 0 || ioctl(created, UI_DEV_CREATE) < 0) {
+        LOGW("wake: uinput device create failed: %s", strerror(errno));
+        close(created);
+        return -1;
+    }
+    int expected = -1;
+    if (!fd.compare_exchange_strong(expected, created)) {
+        close(created);
+        return expected;
+    }
+    LOGI("wake: uinput KEY_WAKEUP device ready");
+    return created;
+}
+
+// inputflinger opens the new device asynchronously and drops keys written before
+// it does, so the device is created at startup, not on the first press.
+// The public entry point lives below, outside the anonymous namespace.
+
+void injectWakeKey() {
+    const int fd = wakeKeyFd();
+    if (fd < 0) {
+        return;
+    }
+    input_event down{};
+    down.type = EV_KEY;
+    down.code = KEY_WAKEUP;
+    down.value = 1;
+    input_event up = down;
+    up.value = 0;
+    input_event syn{};
+    syn.type = EV_SYN;
+    syn.code = SYN_REPORT;
+    (void)!write(fd, &down, sizeof(down));
+    (void)!write(fd, &syn, sizeof(syn));
+    (void)!write(fd, &up, sizeof(up));
+    (void)!write(fd, &syn, sizeof(syn));
+}
+
 void wakeDisplay(bool force = false) {
     const int64_t now = monotonicMs();
     const int64_t last = g_last_wake_ms.load(std::memory_order_acquire);
@@ -194,21 +222,55 @@ void wakeDisplay(bool force = false) {
     if (!force && last != 0 && now - last < kWakeDebounceMs) {
         return;
     }
-    // Two wake paths, both needed: the injected KEYCODE_WAKEUP is what makes
-    // SystemUI treat the screen as interactive and create the authenticate
-    // operation, and the vendor's kernel wakelock (tran_fp -> do_wakeup_set) brings
-    // the panel up when the display was really asleep.
+    // The vendor's kernel wakelock (tran_fp -> do_wakeup_set) is the only wake path
+    // Two wake paths, both needed: the vendor's kernel wakelock
+    // (tran_fp -> do_wakeup_set) brings the SoC up, and the virtual KEY_WAKEUP
+    // below makes the display interactive so SystemUI draws the keyguard and
+    // creates the authenticate operation. Key injection also launched the camera
+    // on this build once (see DEBUG.md, F12); that happened with EV_KEY 0xb7 on
+    // the real touch device, not with a separate KEY_WAKEUP device.
     // Cached: this used to open and read the sysfs node on every idle touch sample,
     // up to a hundred times per second on the reader (review H-15).
     if (cachedBacklightLevel() > 0) {
         return;
     }
     g_last_wake_ms.store(now, std::memory_order_release);
+    // The virtual key turns the panel on; the vendor wakelock alone only keeps
+    // the SoC awake and SystemUI never draws the keyguard without it.
     injectWakeKey();
     VendorEngine::instance().wakeSystem();
 }
 
+// Enrollment ids cross into a framework that keeps the value it was handed and
+// later deletes the enrollment by that same id. The engine reports a negative id
+// on the last enrollment step, so the framework stored a template and removed it
+// at once: remove(-11558431) right after the final progress callback, and the
+// fingerprint count went 1 -> 0 while enrollment had "succeeded" on screen.
+// Nothing negative may leave this HAL: the framework deleted the enrollment as
+// soon as it received a negative id. Collapsing every negative id to 0 was the
+// opposite failure — two templates shared one name, and remove(0) matched
+// nothing in the TA, so a stored template could never be deleted and kept its
+// finger from being enrolled again. Clear the sign bit instead: the id stays
+// positive, distinct and stable across reboots.
+int32_t frameworkEnrollmentId(int32_t engine_id) {
+    return static_cast<int32_t>(static_cast<uint32_t>(engine_id) & 0x7fffffffu);
+}
+
+// The inverse, for the ids the framework hands back to remove(). A framework id
+// above 2^30 can only have come from a negative engine id.
+// shortcut: engine ids beyond +-2^30 alias, revisit if the TA ever returns one.
+int32_t engineEnrollmentId(int32_t framework_id) {
+    return framework_id >= 0x40000000
+               ? static_cast<int32_t>(static_cast<uint32_t>(framework_id) | 0x80000000u)
+               : framework_id;
+}
 }  // namespace
+
+// Public entry point: creates the virtual KEY_WAKEUP device ahead of the first
+// press, because inputflinger opens new devices asynchronously and drops early
+// events.
+void wakeKeyInit() { (void)wakeKeyFd(); }
+
 
 std::atomic<int32_t> Session::applied_user_id_{-1};
 
@@ -336,8 +398,10 @@ uint64_t Session::beginOperation(State next_state) {
             timeout_id_ = 0;
         }
         const std::weak_ptr<Session> weak = self_;
+        const int timeout_ms =
+            next_state == State::kEnrolling ? kEnrollOperationTimeoutMs : kOperationTimeoutMs;
         timeout_id_ = timers_.scheduleAfter(
-            std::chrono::milliseconds(kOperationTimeoutMs), [weak, generation] {
+            std::chrono::milliseconds(timeout_ms), [weak, generation] {
                 if (auto self = weak.lock()) {
                     self->timeoutOperation(generation);
                 }
@@ -346,7 +410,7 @@ uint64_t Session::beginOperation(State next_state) {
             // The deadline queue was full: the operation would wait forever and the
             // framework with it. Fail it now instead of leaking it (review H-47).
             LOGE("session: no deadline slot, failing the operation immediately");
-            postTerminalError(fp::Error::UNABLE_TO_PROCESS, 0,
+            postTerminalError(fp::Error::UNABLE_TO_PROCESS,
                               cancel_epoch_.load(std::memory_order_acquire));
         }
     }
@@ -396,7 +460,7 @@ bool Session::finishOperation(uint64_t generation, bool close_hbm) {
     return true;
 }
 
-void Session::failOperation(uint64_t generation, fp::Error error, int32_t vendor_code) {
+void Session::failOperation(uint64_t generation, fp::Error error) {
     if (!finishOperation(generation, /*close_hbm=*/true)) {
         return;
     }
@@ -404,12 +468,12 @@ void Session::failOperation(uint64_t generation, fp::Error error, int32_t vendor
     // Deliver terminal errors asynchronously. failOperation can be reached from
     // the SerialWorker; calling Binder from there would block vendor work.
     const uint64_t epoch = cancel_epoch_.load(std::memory_order_acquire);
-    postTerminalError(error, vendor_code, epoch);
+    postTerminalError(error, epoch);
 }
 
-void Session::postTerminalError(fp::Error error, int32_t vendor_code, uint64_t epoch) {
+void Session::postTerminalError(fp::Error error, uint64_t epoch) {
     const std::weak_ptr<Session> weak = self_;
-    postToUi([weak, error, vendor_code, epoch] {
+    postToUi([weak, error, epoch] {
         auto self = weak.lock();
         if (!self || self->closed_.load(std::memory_order_acquire)) {
             return;
@@ -418,7 +482,7 @@ void Session::postTerminalError(fp::Error error, int32_t vendor_code, uint64_t e
         if (self->cancel_epoch_.load(std::memory_order_acquire) != epoch) {
             return;
         }
-        self->emitError(error, vendor_code);
+        self->emitError(error);
     });
 }
 
@@ -447,7 +511,7 @@ void Session::timeoutOperation(uint64_t generation) {
     const uint64_t epoch = cancel_epoch_.load(std::memory_order_acquire);
     // A GOOD frame without a comparison means the engine failed, not that the
     // user waited: say so instead of a generic timeout every 60 seconds.
-    postTerminalError(captured ? fp::Error::UNABLE_TO_PROCESS : fp::Error::TIMEOUT, 0, epoch);
+    postTerminalError(captured ? fp::Error::UNABLE_TO_PROCESS : fp::Error::TIMEOUT, epoch);
 }
 
 void Session::cancelOperation(uint64_t generation) {
@@ -482,7 +546,7 @@ void Session::cancelOperation(uint64_t generation) {
     // Async, not inline: this runs on the Binder thread that called
     // ICancellationSignal.cancel(). Delivering onError() synchronously from
     // inside that call can re-enter the framework while it holds its own lock.
-    postTerminalError(fp::Error::CANCELED, 0, cancel_epoch);
+    postTerminalError(fp::Error::CANCELED, cancel_epoch);
 
     // Sensor watchdog from the spec: if the engine ignored the first cancel,
     // repeat it after ~3 s. A new operation invalidates this epoch.
@@ -555,41 +619,73 @@ bool Session::armIllumination(bool allow_wake) {
         wakeDisplay();
     }
 
-    // No off/on "reset" here. It closed the window and reopened it on every
-    // re-arm, which the user saw as flicker, and it trusted a software flag
-    // instead of the panel. requestOn() now re-checks the node itself.
-    bool woke_display = !allow_wake;
-    for (int attempt = 0; attempt < kHbmArmAttempts; ++attempt) {
-        // Abort the moment the reason to be bright is gone. Without this the
-        // retry loop kept driving the panel for hundreds of milliseconds after
-        // the finger had left: the screen lit up on its own, and the sensor
-        // finished a capture on whatever finger happened to be there by then -
-        // which is what looked like an unlock by a different finger.
-        const State now_state = state_.load(std::memory_order_acquire);
-        if (now_state != State::kAuthenticating && now_state != State::kEnrolling) {
-            LOGD("session: illumination aborted, no operation");
-            return false;
-        }
-        if (!finger_down_.load(std::memory_order_acquire)) {
-            LOGD("session: illumination aborted, finger is up");
-            return false;
-        }
-        if (HbmController::instance().requestOn()) {
-            // The ONE place that declares the UI ready, and only after the panel
-            // was verified bright.
-            VendorEngine::instance().notifyUiReady(1);
-            return true;
-        }
-        if (!woke_display && attempt >= 2) {
-            woke_display = true;
-            wakeDisplay();
-        }
-        if (attempt + 1 < kHbmArmAttempts) {
-            ::usleep(kHbmArmRetryUs);
-        }
+    // One attempt, then one deferred retry. The old loop slept between four
+    // attempts and woke the display again in the middle of them, which the user
+    // saw as a flash whenever the panel happened to be at the boundary; and a
+    // sleep on the callback dispatcher held every queued callback behind it
+    // (review H-12/H-33).
+    if (tryArmIllumination()) {
+        return true;
     }
-    LOGE("session: illumination unavailable after %d attempts", kHbmArmAttempts);
+    scheduleIlluminationRetry();
     return false;
+}
+
+bool Session::tryArmIllumination() {
+    // Abort the moment the reason to be bright is gone. Without this the retry
+    // kept driving the panel for hundreds of milliseconds after the finger had
+    // left: the screen lit up on its own, and the sensor finished a capture on
+    // whatever finger happened to be there by then - which is what looked like
+    // an unlock by a different finger.
+    const State now_state = state_.load(std::memory_order_acquire);
+    if (now_state != State::kAuthenticating && now_state != State::kEnrolling) {
+        LOGD("session: illumination aborted, no operation");
+        return false;
+    }
+    if (!finger_down_.load(std::memory_order_acquire)) {
+        LOGD("session: illumination aborted, finger is up");
+        return false;
+    }
+    if (!HbmController::instance().requestOn()) {
+        return false;
+    }
+    // The ONE place that declares the UI ready, and only after the panel was
+    // verified bright.
+    VendorEngine::instance().notifyUiReady(1);
+    return true;
+}
+
+void Session::scheduleIlluminationRetry() {
+    // One retry in flight at a time; a request that arrives meanwhile is dropped
+    // because requestOn() is idempotent for an open window anyway.
+    if (illumination_retry_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    const std::weak_ptr<Session> weak = self_;
+    // The retry itself runs on the dispatcher: requestOn() blocks for up to its
+    // own timeout and the timer thread has to stay free for everyone else.
+    const uint64_t token = timers_.scheduleAfter(std::chrono::milliseconds(kHbmArmRetryMs), [weak] {
+        auto self = weak.lock();
+        if (!self) {
+            return;
+        }
+        self->illumination_retry_.store(false, std::memory_order_release);
+        if (self->closed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        self->postToUi([weak] {
+            auto inner = weak.lock();
+            if (!inner) {
+                return;
+            }
+            if (!inner->tryArmIllumination()) {
+                LOGE("session: illumination still unavailable on the retry");
+            }
+        });
+    });
+    if (token == 0) {
+        illumination_retry_.store(false, std::memory_order_release);
+    }
 }
 
 bool Session::illuminationQuarantined() const {
@@ -631,7 +727,7 @@ void Session::requestIllumination(bool allow_wake) {
     }
 }
 
-bool Session::armCapture(uint64_t generation, State expected, bool open_window) {
+bool Session::armCapture(uint64_t generation, State expected) {
     if (!isCurrent(generation, expected)) {
         return false;
     }
@@ -655,52 +751,13 @@ bool Session::armCapture(uint64_t generation, State expected, bool open_window) 
     // the panel window; the engine's UI-ready wait also consults this state.
     engine.notifyScreenState(VendorEngine::kScreenStateOn);
 
-    if (!open_window) {
-        // Authentication is started by the framework as soon as the keyguard
-        // appears, long before a finger is anywhere near the sensor. Opening the
-        // illumination window here would flash the whole panel on every lock.
-        // The window is opened on the first touch instead (see onTouchEvent),
-        // while the engine simply waits for the FULL_HBM_SET gate.
-        LOGI("session: illumination deferred until touch");
-        illumination_pending_.store(true, std::memory_order_release);
-        return true;
-    }
-
-    bool armed = false;
-    bool woke_display = false;
-    for (int attempt = 0; attempt < kHbmArmAttempts; ++attempt) {
-        if (HbmController::instance().requestOn()) {
-            armed = true;
-            break;
-        }
-        if (!isCurrent(generation, expected)) {
-            return false;
-        }
-        // Two failed attempts means the panel is almost certainly dozing. Wake
-        // the display once, then keep retrying: the driver only accepts the HBM
-        // write for an awake panel.
-        if (!woke_display && attempt >= 2) {
-            woke_display = true;
-            wakeDisplay();
-        }
-        if (attempt + 1 < kHbmArmAttempts) {
-            ::usleep(kHbmArmRetryUs);
-        }
-    }
-    if (!armed) {
-        LOGE("session: panel HBM unavailable after %d attempts, aborting capture",
-             kHbmArmAttempts);
-        return false;
-    }
-    if (!isCurrent(generation, expected)) {
-        HbmController::instance().requestOff();
-        return false;
-    }
-
-    // Only now, with the panel verified bright and the FULL_HBM_SET gate
-    // satisfied, is it meaningful to declare the UI ready.
-    engine.notifyUiReady(1);
-    engine.notifyScreenState(VendorEngine::kScreenStateOn);
+    // Authentication is started by the framework as soon as the keyguard
+    // appears, long before a finger is anywhere near the sensor. Opening the
+    // illumination window here would flash the whole panel on every lock.
+    // The window is opened on the first touch instead (see onTouchEvent),
+    // while the engine simply waits for the FULL_HBM_SET gate.
+    LOGI("session: illumination deferred until touch");
+    illumination_pending_.store(true, std::memory_order_release);
     return true;
 }
 
@@ -708,9 +765,12 @@ void Session::runEnroll(uint64_t generation, AuthToken hat) {
     if (!isCurrent(generation, State::kEnrolling)) {
         return;
     }
-    if (!armCapture(generation, State::kEnrolling, /*open_window=*/true)) {
+    // Like authentication, enrollment defers the window to the first touch: the
+    // panel must not sit at maximum brightness while the user reads the screen,
+    // and every later capture re-opens the window from the touch handler.
+    if (!armCapture(generation, State::kEnrolling)) {
         if (isCurrent(generation, State::kEnrolling)) {
-            failOperation(generation, fp::Error::HW_UNAVAILABLE, 0);
+            failOperation(generation, fp::Error::HW_UNAVAILABLE);
         }
         return;
     }
@@ -740,7 +800,7 @@ void Session::runEnroll(uint64_t generation, AuthToken hat) {
         return;
     }
     if (rc != 0) {
-        failOperation(generation, fp::Error::UNABLE_TO_PROCESS, rc);
+        failOperation(generation, fp::Error::UNABLE_TO_PROCESS);
     }
 }
 
@@ -748,9 +808,9 @@ void Session::runAuthenticate(uint64_t generation, int64_t operation_id) {
     if (!isCurrent(generation, State::kAuthenticating)) {
         return;
     }
-    if (!armCapture(generation, State::kAuthenticating, /*open_window=*/false)) {
+    if (!armCapture(generation, State::kAuthenticating)) {
         if (isCurrent(generation, State::kAuthenticating)) {
-            failOperation(generation, fp::Error::HW_UNAVAILABLE, 0);
+            failOperation(generation, fp::Error::HW_UNAVAILABLE);
         }
         return;
     }
@@ -770,7 +830,7 @@ void Session::runAuthenticate(uint64_t generation, int64_t operation_id) {
         return;
     }
     if (rc != 0) {
-        failOperation(generation, fp::Error::UNABLE_TO_PROCESS, rc);
+        failOperation(generation, fp::Error::UNABLE_TO_PROCESS);
     }
 }
 
@@ -836,16 +896,19 @@ void Session::onEngineMessage(const EngineMessage& message) {
 
     if (message.type == kEngineMsgError) {
         bool enumerate_active = false;
+        uint64_t enumerate_generation = 0;
         {
             std::lock_guard<std::mutex> lock(enum_mutex_);
             enumerate_active = enum_active_;
             if (enumerate_active) {
                 enum_error_ = true;
-                enum_dirty_ = true;
-                enum_cv_.notify_all();
+                enumerate_generation = enum_generation_;
             }
         }
         if (enumerate_active) {
+            // A failed enumerate is final: flush now instead of waiting out the
+            // quiet window, which would only delay the framework's answer (H-12).
+            enumerateSettle(enumerate_generation);
             // The errors are not swallowed for an operation that is running at the
             // same time: it used to hang until its own 60 s timeout (review H-18).
             const State running = state_.load(std::memory_order_acquire);
@@ -865,7 +928,7 @@ void Session::onEngineMessage(const EngineMessage& message) {
     switch (message.type) {
         case kEngineMsgError:
             LOGW("session: engine error code %d", message.a);
-            failOperation(generation, mapEngineError(message.a), message.a);
+            failOperation(generation, mapEngineError(message.a));
             return;
 
         case kEngineMsgAcquired: {
@@ -890,26 +953,34 @@ void Session::onEngineMessage(const EngineMessage& message) {
             if (!isCurrent(generation, State::kEnrolling)) {
                 return;
             }
-            const int32_t enrollment_id = message.b;
-            if (enrollment_id > 0) {
-                // The id the engine reports on a match later (review H-08).
-                single_template_id_.store(enrollment_id, std::memory_order_release);
-            }
+            const int32_t engine_id = message.b;
+            const int32_t enrollment_id = frameworkEnrollmentId(engine_id);
+            // The id the engine reports on a match later (review H-08), stored
+            // normalised so a match and an enumeration name the same template.
+            single_template_id_.store(enrollment_id, std::memory_order_release);
             HbmController::instance().keepAlive();
 
             const int32_t total = enroll_steps_total_.load(std::memory_order_acquire);
             const int32_t done = enroll_steps_done_.fetch_add(1, std::memory_order_acq_rel) + 1;
 
-            // The engine reports its counter verbatim and never decrements it, so
-            // completion is decided here: the template is complete after
-            // GET_ENROLL_NUM accepted steps (20 for this part).
-            int32_t remaining = total - done;
-            if (remaining < 0) {
-                remaining = 0;
+            // silfp_notify_send_enroll_notice(fid, gid, remaining) carries the
+            // engine's own counter in the third integer (extra()), seeded by
+            // GET_ENROLL_NUM and decremented by the TA. The two integers in the
+            // wire header are the template id and the gid this HAL passed to
+            // enroll(), which never change; reporting those as progress pinned
+            // the framework at its first value. Use the engine's counter when it
+            // is sane and fall back to counting accepted steps.
+            const int32_t engine_remaining = message.extra();
+            int32_t remaining = engine_remaining;
+            if (remaining < 0 || remaining >= total) {
+                remaining = total - done;
+                if (remaining < 0) {
+                    remaining = 0;
+                }
             }
 
-            LOGI("session: enrollment step %d/%d id=%d engine_remaining=%d -> report %d", done,
-                 total, enrollment_id, message.a, remaining);
+            LOGI("session: enrollment step %d/%d id=%d (engine %d) engine_notice=(%d,%d) -> report %d",
+                 done, total, enrollment_id, engine_id, message.a, engine_remaining, remaining);
 
             if (remaining > 0) {
                 emitEnrollmentProgress(enrollment_id, remaining);
@@ -979,10 +1050,10 @@ void Session::onEngineMessage(const EngineMessage& message) {
             // (review H-08).
             const int32_t known_id = single_template_id_.load(std::memory_order_acquire);
             const int32_t enrollment_id = (message.b > 0) ? message.b : known_id;
-            if (enrollment_id <= 0) {
+            if (enrollment_id < 0) {
                 LOGE("session: match without a usable template id (engine %d, known %d)",
                      message.b, known_id);
-                failOperation(generation, fp::Error::UNABLE_TO_PROCESS, 0);
+                failOperation(generation, fp::Error::UNABLE_TO_PROCESS);
                 return;
             }
             if (!isAuthTokenPlausible(message.hat)) {
@@ -1034,23 +1105,18 @@ void Session::onEngineMessage(const EngineMessage& message) {
                 ::usleep(kUiReadyPollMs * 1000);
             }
             LOGI("session: authentication succeeded id=%d", enrollment_id);
-            // The panel is about to be turned off by the framework; arm the gesture
-            // now, while the controller is still powered, or the next press in sleep
-            // finds no gesture path at all.
-            rearmGestureMode();
             last_success_ms_.store(monotonicMs(), std::memory_order_release);
+            // The press that unlocked this operation is over. A pending overlay wait
+            // must not fire later and grab a capture with the same resting finger
+            // for the next operation the framework opens - that reads as a failed
+            // attempt and re-locks the screen.
+            overlay_wait_active_.store(false, std::memory_order_release);
             emitAuthenticationSucceeded(enrollment_id, token);
             // The window may have been kept open for the result; once the framework
             // has it, the panel must go back to normal brightness.
             HbmController::instance().requestOff();
-            // And the hold-mode helper must give the display back right away.
-            {
-                const int fd = ::open(km6fod::kHoldOffPath,
-                                      O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
-                if (fd >= 0) {
-                    ::close(fd);
-                }
-            }
+            // The panel may have been kept bright for the result; once the framework
+            // has it, the backlight goes back to normal.
             // The framework accepts the result but, with the panel asleep, does
             // not bring the display up by itself. KEY_WAKEUP is a no-op on an
             // awake screen, so it is safe to emit unconditionally; probing the
@@ -1071,27 +1137,30 @@ void Session::onEngineMessage(const EngineMessage& message) {
 
 void Session::handleEnumerateMessage(const EngineMessage& message) {
     std::lock_guard<std::mutex> lock(enum_mutex_);
+    // A notice is engine truth whether or not our window is open: it can arrive
+    // while open() or set_active_group() is still running, and dropping it gave the
+    // framework an empty authoritative list, which erased the enrollment on boot
+    // (review H-10). startEnumerate() clears the buffer, so nothing leaks forward.
     if (!enum_active_) {
         LOGD("session: enumerate notice id=%d outside enumeration", message.b);
-        return;
     }
-    if (message.b <= 0) {
-        LOGD("session: enumerate notice with non-positive id %d dropped", message.b);
-        return;
-    }
+    // A negative id is a real template, not a failure: the TA hands back such an
+    // id for a template that is still in storage. Map it to a stable non-negative
+    // id — the framework stores that value and later deletes the enrollment by it.
+    const int32_t enrollment_id = frameworkEnrollmentId(message.b);
     // The engine can report the same id twice; the framework keeps the list as-is
     // and a duplicate then breaks removeEnrollments (review H-20).
     for (int32_t known : enumerated_) {
-        if (known == message.b) {
+        if (known == enrollment_id) {
             return;
         }
     }
-    enumerated_.push_back(message.b);
+    enumerated_.push_back(enrollment_id);
     if (enumerated_.size() == 1) {
-        single_template_id_.store(message.b, std::memory_order_release);
+        single_template_id_.store(enrollment_id, std::memory_order_release);
     }
-    enum_dirty_ = true;
-    enum_cv_.notify_all();
+    // The quiet window is measured from the last notice, not from enumerate().
+    enum_last_notice_ms_ = monotonicMs();
 }
 
 void Session::onFodKey(bool down) {
@@ -1148,11 +1217,6 @@ void Session::onFodKey(bool down) {
     gesture_token_.fetch_add(1, std::memory_order_acq_rel);
     LOGI("session: FOD wake gesture");
 
-    // Every accepted gesture re-arms the next one. The controller clears the
-    // per-gesture bit on suspend and this device does not always report the
-    // LOCKSCREEN transition before the panel goes dark, so relying on that
-    // transition alone left the chain dead until a reboot.
-    rearmGestureMode();
 
     // While the framework is in detect mode it is waiting for exactly this: a
     // finger on the sensor. Reporting it is what makes the framework wake the
@@ -1198,24 +1262,38 @@ void Session::armFodPress() {
     VendorEngine::instance().notifyScreenState(VendorEngine::kScreenStateOn);
 
     // The overlay that provides the actual light is drawn by SystemUI after the
-    // display comes up. Wait for it briefly instead of bailing out: this is what
-    // makes a single press work instead of requiring a second touch.
-    bool ready = false;
-    for (int waited = 0; waited < kUiReadyWaitMs; waited += kUiReadyPollMs) {
-        if (uiReadyValid()) {
-            ready = true;
-            break;
+    // display comes up. Waiting for it is what makes a single press work instead
+    // of requiring a second touch, but the wait must not park the serial worker:
+    // it is a timer, and the press body continues on the worker (review H-12).
+    const int64_t delay_ms = panelBacklightLevel() == 0 ? kUiReadyWaitMs : 0;
+    const std::weak_ptr<Session> weak = self_;
+    const uint64_t token = timers_.scheduleAfter(std::chrono::milliseconds(delay_ms), [weak] {
+        if (auto self = weak.lock()) {
+            self->postToWorker([weak] {
+                if (auto inner = weak.lock()) {
+                    inner->continueFodPress();
+                }
+            });
         }
-        // The framework reports the wake-up through OperationContext; once the
-        // display is no longer reported as asleep the overlay is on its way.
-        const int32_t display = display_state_.load(std::memory_order_acquire);
-        if (display != static_cast<int32_t>(bc::DisplayState::AOD) &&
-            display != static_cast<int32_t>(bc::DisplayState::UNKNOWN)) {
-            ready = true;
-            break;
-        }
-        ::usleep(kUiReadyPollMs * 1000);
+    });
+    if (token == 0) {
+        continueFodPress();
     }
+}
+
+// The part of a dark-screen press that needs the display up: tell the engine the
+// finger is down and light the glass. Runs on the serial worker.
+void Session::continueFodPress() {
+    if (closed_.load(std::memory_order_acquire)) {
+        return;
+    }
+    // Whether the overlay is already up is only logged; the press is lit either
+    // way. Polling for it here is what blocked the worker for the whole wake
+    // window, so it is a single observation now.
+    const int32_t display = display_state_.load(std::memory_order_acquire);
+    const bool ready = uiReadyValid() ||
+                       (display != static_cast<int32_t>(bc::DisplayState::AOD) &&
+                        display != static_cast<int32_t>(bc::DisplayState::UNKNOWN));
     LOGD("trace: gesture ready=%d dark=%d isOn=%d pending=%d state=%d", ready ? 1 : 0,
          panelBacklightLevel() == 0 ? 1 : 0, HbmController::instance().isOn() ? 1 : 0,
          illumination_pending_.load(std::memory_order_acquire) ? 1 : 0,
@@ -1287,7 +1365,11 @@ void Session::finishGestureRelease(uint64_t token) {
         // A GOOD frame means the engine is comparing right now. Killing the light a
         // few milliseconds later is what made the result arrive blind and get
         // dropped; the watchdog closes the window when the result lands.
-        if (frame_good_.load(std::memory_order_acquire)) {
+        // Enrollment has no result to display: the light only feeds the capture, so
+        // the window follows the finger there and never outlives it.
+        const bool keep_for_result =
+            op_state == State::kAuthenticating && frame_good_.load(std::memory_order_acquire);
+        if (keep_for_result) {
             LOGI("session: finger up with a captured frame, light kept for the result");
         } else {
             LOGI("session: finger up, closing illumination window");
@@ -1301,11 +1383,34 @@ void Session::overlayTick(int waited) {
         return;
     }
     const State inner = state_.load(std::memory_order_acquire);
-    if (uiReadyValid() && (inner == State::kAuthenticating || inner == State::kEnrolling)) {
-        LOGI("session: overlay appeared, illuminating");
+    const bool capturing =
+        inner == State::kAuthenticating || inner == State::kEnrolling;
+    // A stale operation issued while the screen was dark never gets its icon, and
+    // the keyguard would swallow the press. At the timeout the panel is already
+    // lit and the finger is still down, so capture without the overlay instead of
+    // throwing the press away.
+    // A press that woke a dark panel gets its capture as soon as the panel is
+    // actually lit: SystemUI draws the icon ~1.4 s after the wake, and waiting for
+    // it was the whole visible stall (4 s presses that still ended in a capture).
+    const int64_t dark_wake = dark_wake_ms_.load(std::memory_order_acquire);
+    const bool dark_press = dark_wake != 0 && monotonicMs() - dark_wake < 3000 &&
+                            panelBacklightLevel() > 0 && HbmController::instance().isOn();
+    if (capturing && (uiReadyValid() || dark_press || waited >= 1500)) {
+        if (uiReadyValid()) {
+            LOGI("session: overlay appeared, illuminating");
+        } else if (dark_press) {
+            LOGI("session: panel is lit, capturing the held press");
+        } else {
+            LOGW("session: overlay did not appear within 1.5 s; capturing the held press");
+        }
         requestIllumination(/*allow_wake=*/false);
         const int64_t touch_age = monotonicMs() - last_touch_ms_.load(std::memory_order_acquire);
-        if (touch_age >= 0 && touch_age < 1500) {
+        // A dark-screen press waits for the icon longer than the gesture's 1.5 s
+        // window, so a finger that is still physically down must be claimed too;
+        // otherwise the light fires and the engine never learns about the press.
+        const bool still_down = finger_down_.load(std::memory_order_acquire);
+        if (touch_age >= 0 && (touch_age < 1500 || still_down)) {
+            LOGI("session: claiming the held press (age %lld ms)", (long long)touch_age);
             // The finger may still be resting on the glass even though the momentary
             // gesture already reported "up" - that is the held press from a dark
             // screen. Claim it so the engine captures this press. The vendor calls
@@ -1322,9 +1427,9 @@ void Session::overlayTick(int waited) {
         return;
     }
     if (waited >= 1500) {
-        // Observable instead of silent: this is the case where the icon stays dark
-        // and the press looks dead.
-        LOGW("session: overlay did not appear within 1.5 s; illumination skipped");
+        // No live operation: there is nothing to capture for, so drop the wait
+        // (the pre-light's own timer closes the light).
+        LOGW("session: overlay did not appear within 1.5 s; no operation to capture");
         overlay_wait_active_.store(false, std::memory_order_release);
         return;
     }
@@ -1394,8 +1499,16 @@ void Session::onTouchEvent(int x, int y, bool down) {
                                                if ((state == State::kEnrolling ||
                                                     state == State::kAuthenticating) &&
                                                    HbmController::instance().isOn()) {
-                                                   if (self->frame_good_.load(
-                                                           std::memory_order_acquire)) {
+                                                   // Only authentication waits for a result that
+                                                   // the light has to show; during enrollment the
+                                                   // window must close as soon as the finger is
+                                                   // gone, or it stays open for the whole walk to
+                                                   // the 30 s absolute cap.
+                                                   const bool keep_for_result =
+                                                       state == State::kAuthenticating &&
+                                                       self->frame_good_.load(
+                                                           std::memory_order_acquire);
+                                                   if (keep_for_result) {
                                                        LOGI("session: finger up with a captured frame, light kept for the result");
                                                    } else {
                                                        LOGI("session: finger up, closing illumination window");
@@ -1412,14 +1525,6 @@ void Session::onTouchEvent(int x, int y, bool down) {
     release_token_.fetch_add(1, std::memory_order_acq_rel);
 
     const bool inside = inSensorZone(x, y);
-    if (!inside) {
-        // Any touch away from the sensor means the user is handling the phone:
-        // tell the hold-mode helper to give the display back (it owns brightness).
-        const int fd = ::open(km6fod::kHoldOffPath, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
-        if (fd >= 0) {
-            ::close(fd);
-        }
-    }
     if (inside) {
         // Record the press before any state check: the touch that wakes the panel
         // arrives while the HAL is still idle, and its coordinates are what let the
@@ -1450,7 +1555,11 @@ void Session::onTouchEvent(int x, int y, bool down) {
     // whenever the overlay is not running. displayState is deliberately not
     // consulted: it is only updated when the framework feels like it and is stale
     // often enough that gating on it left presses doing nothing at all.
-    if (state == State::kIdle || (inside && !uiReadyValid())) {
+    // Only a dark panel is a "wake press". On a lit screen a touch with no
+    // operation is just a touch: waking and starting the overlay wait there made
+    // that wait fire later, after the framework had opened the next operation,
+    // and capture a resting finger - which read as a failed attempt and re-locked.
+    if (panelBacklightLevel() == 0 && (state == State::kIdle || (inside && !uiReadyValid()))) {
         if (inside) {
             static thread_local int64_t last_ms = 0;
             const int64_t now = monotonicMs();
@@ -1462,12 +1571,19 @@ void Session::onTouchEvent(int x, int y, bool down) {
             // the gesture in the kernel), so the pre-light has to happen here too:
             // otherwise the panel stays dark until the framework creates the
             // operation, and the press is spent before there is any light.
-            // Waking costs a JVM start (~250 ms), so it happens only when there is
-            // no operation yet: hold mode wakes the keyguard once on entry, and a
-            // press then goes straight to the capture.
+            // Waking costs a JVM start (~250 ms), so it happens only when the panel
+            // is dark: a live operation does not imply an awake display - after a
+            // blank the framework keeps its session (and re-issues it every 60 s),
+            // and in that state the capture gate stays closed because the panel is
+            // off. HBM on means the dark panel is already lit for a capture.
             const State touch_state = state_.load(std::memory_order_acquire);
-            if (touch_state == State::kIdle) {
+            if (touch_state == State::kIdle ||
+                (panelBacklightLevel() == 0 && !HbmController::instance().isOn())) {
                 wakeDisplay();
+                // Remember that this press woke a dark panel: its icon arrives far
+                // too late for the capture budget, so the press is captured as soon
+                // as the panel is lit instead of waiting for the overlay.
+                dark_wake_ms_.store(monotonicMs(), std::memory_order_release);
             }
             // Only light ahead of the capture when there IS a capture to light for.
             // A touch with no operation (state == kIdle) is just a touch: it used to
@@ -1475,6 +1591,26 @@ void Session::onTouchEvent(int x, int y, bool down) {
             // operation ("overlay did not appear").
             const bool capturing = touch_state == State::kEnrolling ||
                                    touch_state == State::kAuthenticating;
+            // A press that lands long after the operation was created meets an engine
+            // that has already given up: measured, a press 1 min 42 s into the
+            // operation answered 1003 ("finger up") and never captured, while a press
+            // 0.9 s in produced code 0 in 147 ms. Re-arm the capture for a new press.
+            if (capturing) {
+                static thread_local int64_t last_arm = 0;
+                const int64_t now_ms = monotonicMs();
+                if (now_ms - last_arm > 1000) {
+                    last_arm = now_ms;
+                    const std::weak_ptr<Session> weak_arm = self_;
+                    const State expected = touch_state;
+                    postToWorker([weak_arm, expected] {
+                        if (auto self = weak_arm.lock()) {
+                            const uint64_t gen =
+                                self->generation_.load(std::memory_order_acquire);
+                            self->armCapture(gen, expected);
+                        }
+                    });
+                }
+            }
             if (capturing && !illuminationQuarantined() &&
                 (panelBacklightLevel() == 0 || !HbmController::instance().isOn())) {
                 LOGI("session: pre-lighting before the overlay");
@@ -1561,10 +1697,18 @@ void Session::onTouchEvent(int x, int y, bool down) {
         // not just the first one of a press. Arming only on the first sample made
         // every later one powerless to relight a window that had closed for any
         // reason - the "lights up only sometimes" the user kept hitting.
-        // requestOn() is idempotent for an open window, so repeating costs almost
-        // nothing, and the work happens off this thread.
+        // The first sample of a press applies the window on this thread because
+        // the next statement tells the engine the finger is down and its capture
+        // starts immediately; requestIllumination() only queues the work, and the
+        // TA then rejects a frame taken in the dark. Later samples can be queued.
         if (!HbmController::instance().isOn()) {
-            requestIllumination(/*allow_wake=*/false);
+            if (fresh_down && !illuminationQuarantined()) {
+                if (HbmController::instance().requestOn()) {
+                    VendorEngine::instance().notifyUiReady(1);
+                }
+            } else {
+                requestIllumination(/*allow_wake=*/false);
+            }
         }
 
         if (fresh_down) {
@@ -1620,34 +1764,71 @@ void Session::onTouchEvent(int x, int y, bool down) {
             if (!self || self->closed_.load(std::memory_order_acquire)) {
                 return;
             }
-            int64_t challenge = 1;
-            if (VendorEngine::instance().open() && self->ensureUserGroup()) {
-                // The group switch kicks off optic calibration, which replaces
-                // the TA's enroll challenge. Wait for it to finish, otherwise
-                // the very next enroll() returns INVALID_CHALLENGE (-1004).
-                if (self->group_just_applied_.exchange(false)) {
-                    LOGI("session: waiting for optic calibration to settle");
-                    ::usleep(kCalibrationSettleUs);
-                }
-                const uint64_t value = VendorEngine::instance().preEnroll();
-                if (value != 0) {
-                    challenge = static_cast<int64_t>(value);
-                }
-            } else {
+            if (!VendorEngine::instance().open() || !self->ensureUserGroup()) {
                 LOGW("session: generateChallenge without a sensor, returning placeholder");
+                self->postToWorker([weak] {
+                    if (auto inner = weak.lock()) {
+                        inner->finishChallenge();
+                    }
+                });
+                return;
             }
-            LOGI("session: challenge %lld", static_cast<long long>(challenge));
-            self->postToUi([weak, challenge] {
-                auto inner = weak.lock();
-                if (!inner || inner->closed_.load(std::memory_order_acquire)) {
-                    return;
-                }
-                inner->emitChallengeGenerated(challenge);
-            });
+            // The group switch kicks off optic calibration, which replaces the
+            // TA's enroll challenge; calling preEnroll() before it finishes makes
+            // the next enroll() return INVALID_CHALLENGE (-1004). The settle is a
+            // timer, not a sleep on the worker (review H-12).
+            if (!self->group_just_applied_.exchange(false)) {
+                self->postToWorker([weak] {
+                    if (auto inner = weak.lock()) {
+                        inner->finishChallenge();
+                    }
+                });
+                return;
+            }
+            LOGI("session: waiting for optic calibration to settle");
+            const uint64_t token = self->timers_.scheduleAfter(
+                std::chrono::milliseconds(kCalibrationSettleMs), [weak] {
+                    if (auto self = weak.lock()) {
+                        self->postToWorker([weak] {
+                            if (auto inner = weak.lock()) {
+                                inner->finishChallenge();
+                            }
+                        });
+                    }
+                });
+            if (token == 0) {
+                self->postToWorker([weak] {
+                    if (auto inner = weak.lock()) {
+                        inner->finishChallenge();
+                    }
+                });
+            }
         })) {
         emitChallengeGenerated(1);
     }
     return ::ndk::ScopedAStatus::ok();
+}
+
+// Asks the TA for the enroll challenge. Runs on the serial worker: preEnroll() is
+// a vendor call.
+void Session::finishChallenge() {
+    if (closed_.load(std::memory_order_acquire)) {
+        return;
+    }
+    int64_t challenge = 1;
+    const uint64_t value = VendorEngine::instance().preEnroll();
+    if (value != 0) {
+        challenge = static_cast<int64_t>(value);
+    }
+    LOGI("session: challenge %lld", static_cast<long long>(challenge));
+    const std::weak_ptr<Session> weak = self_;
+    postToUi([weak, challenge] {
+        auto inner = weak.lock();
+        if (!inner || inner->closed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        inner->emitChallengeGenerated(challenge);
+    });
 }
 
 ::ndk::ScopedAStatus Session::revokeChallenge(int64_t in_challenge) {
@@ -1687,7 +1868,7 @@ void Session::onTouchEvent(int x, int y, bool down) {
             }
             self->runEnroll(generation, hat);
         })) {
-        failOperation(generation, fp::Error::UNABLE_TO_PROCESS, -1);
+        failOperation(generation, fp::Error::UNABLE_TO_PROCESS);
     }
     return ::ndk::ScopedAStatus::ok();
 }
@@ -1725,7 +1906,7 @@ void Session::onTouchEvent(int x, int y, bool down) {
             }
             self->runAuthenticate(generation, operation_id);
         })) {
-        failOperation(generation, fp::Error::UNABLE_TO_PROCESS, -1);
+        failOperation(generation, fp::Error::UNABLE_TO_PROCESS);
     }
     return ::ndk::ScopedAStatus::ok();
 }
@@ -1775,7 +1956,9 @@ void Session::startEnumerate() {
         generation = ++enum_generation_;
         enum_active_ = true;
         enum_error_ = false;
-        enum_dirty_ = false;
+        // The quiet window is measured from here; every accepted notice moves it.
+        enum_started_ms_ = monotonicMs();
+        enum_last_notice_ms_ = enum_started_ms_;
         enumerated_.clear();
     }
 
@@ -1809,34 +1992,54 @@ void Session::runEnumerate(uint64_t generation) {
     if (rc != 0) {
         LOGW("session: enumerate rc=%d", rc);
     }
+    {
+        // The quiet window starts when the engine is actually asked, not when the
+        // framework called us: open() can take hundreds of milliseconds, and the
+        // budget spent inside it made the window close empty on boot (0 templates).
+        std::lock_guard<std::mutex> lock(enum_mutex_);
+        if (generation == enum_generation_ && enum_active_) {
+            enum_started_ms_ = monotonicMs();
+            enum_last_notice_ms_ = enum_started_ms_;
+        }
+    }
 
-    const auto started = std::chrono::steady_clock::now();
-    auto quiet_since = started;
-    for (;;) {
-        std::unique_lock<std::mutex> lock(enum_mutex_);
+    // The quiet window is a timer now: the worker must stay free for the rest of
+    // the framework's calls while the engine finishes reporting (review H-12).
+    enumerateSettle(generation);
+}
+
+// Flushes the enumeration buffer once the engine has gone quiet on it. Runs on the
+// timer thread and never blocks: each call either re-arms for the remaining
+// window or finishes the enumeration.
+void Session::enumerateSettle(uint64_t generation) {
+    bool flush = false;
+    int64_t wait_ms = 0;
+    {
+        std::lock_guard<std::mutex> lock(enum_mutex_);
         if (generation != enum_generation_ || !enum_active_) {
             return;
         }
-        if (enum_error_) {
-            break;
+        // Three things end the window: the engine went quiet, the hard budget
+        // expired, or the engine reported an error. Both deadlines are measured
+        // from the last notice, so a late burst is not cut in half.
+        const int64_t now = monotonicMs();
+        const int64_t quiet_at = enum_last_notice_ms_ + kEnumerateQuietMs;
+        const int64_t hard_at = enum_started_ms_ + kEnumerateMaxMs;
+        wait_ms = enum_error_ ? 0 : std::min(quiet_at, hard_at) - now;
+        flush = wait_ms <= 0;
+    }
+    if (!flush) {
+        const std::weak_ptr<Session> weak = self_;
+        const uint64_t token =
+            timers_.scheduleAfter(std::chrono::milliseconds(wait_ms), [weak, generation] {
+                if (auto self = weak.lock()) {
+                    self->enumerateSettle(generation);
+                }
+            });
+        if (token != 0) {
+            return;
         }
-        const auto now = std::chrono::steady_clock::now();
-        if (now - started >= std::chrono::milliseconds(kEnumerateMaxMs)) {
-            break;
-        }
-        const auto quiet_deadline = quiet_since + std::chrono::milliseconds(kEnumerateQuietMs);
-        const auto hard_deadline = started + std::chrono::milliseconds(kEnumerateMaxMs);
-        const auto wake_at = std::min(quiet_deadline, hard_deadline);
-        if (now >= wake_at) {
-            break;
-        }
-        if (enum_cv_.wait_until(lock, wake_at, [&] { return enum_dirty_ || enum_error_; })) {
-            if (enum_error_) {
-                break;
-            }
-            enum_dirty_ = false;
-            quiet_since = std::chrono::steady_clock::now();
-        }
+        LOGW("session: timer queue full, flushing the enumeration early");
     }
 
     std::vector<int32_t> ids;
@@ -1849,26 +2052,11 @@ void Session::runEnumerate(uint64_t generation) {
         ids = enumerated_;
         error = enum_error_;
         enum_active_ = false;
-        enum_dirty_ = false;
     }
-    // The marker survives a reboot: the first enumeration after boot is exactly
-    // where a transient empty answer would wipe the enrollment for good.
-    const char* kMarker = km6fod::kTemplatesMarkerPath;
-    const bool seen_before = saw_templates_.load(std::memory_order_acquire) ||
-                             ::access(kMarker, F_OK) == 0;
-    if (!error && ids.empty() && seen_before) {
-        // The engine already reported templates in this boot; an empty answer now
-        // is a transient failure, not a wipe. Never destroy the user's enrollment.
-        LOGW("session: empty enumeration after a non-empty one, reporting an error");
-        error = true;
-    }
-    if (!ids.empty()) {
-        saw_templates_.store(true, std::memory_order_release);
-        const int fd = ::open(kMarker, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
-        if (fd >= 0) {
-            ::close(fd);
-        }
-    }
+    // A successful enumeration is authoritative even when it is empty: the
+    // framework must receive the empty list, otherwise it cannot tell "no
+    // templates" from a transient failure and refuses a new enrollment (H-10).
+    // A failed call still sets authoritative=false, so F-013 is preserved.
     finishEnumerate(generation, std::move(ids), /*authoritative=*/!error);
 }
 
@@ -1897,7 +2085,7 @@ void Session::finishEnumerate(uint64_t generation, std::vector<int32_t> ids,
             // list as authoritative and drops the enrollment, which is how a
             // transient engine error erased the user's fingerprint (review F-013).
             LOGE("session: enumeration failed, reporting an error instead of an empty list");
-            self->emitError(fp::Error::UNABLE_TO_PROCESS, 0);
+            self->emitError(fp::Error::UNABLE_TO_PROCESS);
             return;
         }
         if (ids.empty()) {
@@ -1931,7 +2119,8 @@ void Session::finishEnumerate(uint64_t generation, std::vector<int32_t> ids,
             VendorEngine& engine = VendorEngine::instance();
             if (engine.open() && self->ensureUserGroup()) {
                 for (int32_t id : ids) {
-                    const int rc = engine.removeEnrollment(gid, static_cast<uint32_t>(id));
+                    const int32_t engine_id = engineEnrollmentId(id);
+                    const int rc = engine.removeEnrollment(gid, static_cast<uint32_t>(engine_id));
                     LOGI("session: remove(%d) rc=%d", id, rc);
                     if (rc == 0) {
                         removed.push_back(id);
@@ -2144,13 +2333,6 @@ void Session::shutdown() {
         // the display is idle, yet the controller keeps believing the panel is
         // bright and would skip the next arm. Close the window so the next arm
         // really issues the panel command again.
-        // The controller drops its gesture bit when it suspends, and this device
-        // never reports AOD: the only signal before sleep is the keyguard
-        // appearing. Rearm there, through the vendor call that actually works.
-        if (display == static_cast<int32_t>(bc::DisplayState::LOCKSCREEN)) {
-            LOGI("session: keyguard shown, re-arming the FOD gesture");
-            rearmGestureMode();
-        }
         if (display == static_cast<int32_t>(bc::DisplayState::NO_UI)) {
             // Unlocked: nothing must keep the sensor area lit any more.
             LOGI("session: unlocked, closing the illumination window");
@@ -2162,7 +2344,6 @@ void Session::shutdown() {
             LOGI("session: display entering doze, closing illumination window");
             illumination_pending_.store(false, std::memory_order_release);
             HbmController::instance().requestOff();
-            rearmGestureMode();
         }
     }
     return ::ndk::ScopedAStatus::ok();
@@ -2229,12 +2410,16 @@ void Session::handleDeadCallback() {
     postToWorker([] { VendorEngine::instance().cancel(); });
 }
 
-bool Session::emitError(fp::Error error, int32_t vendor_code) {
+bool Session::emitError(fp::Error error) {
     if (!callback_) {
         return false;
     }
-    LOGW("session: onError(%d, vendor=%d)", static_cast<int>(error), vendor_code);
-    return checkCallback(callback_->onError(error, vendor_code), "onError");
+    // vendorCode must stay 0: FingerprintManager.getErrorString() indexes its
+    // per-sensor string table with it, and a raw engine code such as -1004
+    // throws ArrayIndexOutOfBoundsException in system_server. None of the
+    // engine codes has a framework string mapping anyway.
+    LOGW("session: onError(%d, vendor=0)", static_cast<int>(error));
+    return checkCallback(callback_->onError(error, 0), "onError");
 }
 
 bool Session::emitAcquired(int32_t engine_code) {

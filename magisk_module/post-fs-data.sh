@@ -12,9 +12,7 @@
 
 MODDIR=${0%/*}
 LOGFILE=/data/adb/km6fod.log
-# The HAL owns /data/adb/km6fod/run (lock, hold_off, templates marker). Both sides
-# must agree on it: writing hold_off to the module directory meant the HAL's signal
-# went into a directory the helper never read (review H-32).
+# One runtime directory, owned by the HAL; every script must use it (review H-32).
 RUN="/data/adb/km6fod/run"
 HBM=/sys/kernel/tran_display/lcm_hbm_state
 
@@ -157,8 +155,8 @@ done
 VENDOR_FP=/vendor/bin/hw/android.hardware.biometrics.fingerprint@2.1-service-mediatek
 # A hot update cannot overwrite files/fp_hal while the previous boot's bind mount
 # still holds the inode (ETXTBSY), so an update is staged next to it and swapped in
-# here, before the mount is created. Same for the helper dex.
-for staged in fp_hal hold.dex; do
+# here, before the mount is created.
+for staged in fp_hal; do
     if [ -f "$MODDIR/files/$staged.new" ]; then
         log "update: installing staged $staged"
         cat "$MODDIR/files/$staged.new" > "$MODDIR/files/$staged" 2>/dev/null &&
@@ -175,34 +173,85 @@ if [ -f "$MODDIR/files/fp_hal" ] && [ -e "$VENDOR_FP" ]; then
     fi
 fi
 
-# ------------------------------------- 1d. Bypass the vendor challenge check
-# The Silead TA rejects the framework's enroll token with -1004
-# INVALID_CHALLENGE even though the challenge inside it is byte-identical to the
-# one pre_enroll() just returned. The pre-flight comparison therefore has to be
-# skipped, and it lives in the vendor library:
+# ------------------------- 1c2. Touch keeps scanning on a dark panel
+# Stock focaltech_ft3683g puts the controller into firmware gesture mode when the
+# display blanks, and adaptive-ts sends its own suspend command; after that a press
+# on a dark screen produces no MT events at all, only a tap gesture. The two
+# patched copies in files/ keep the controller in normal scan mode, so the HAL sees
+# the finger that is already resting on the sensor when the panel comes up.
+# The patches are four bytes each and are valid only for the exact vendor builds
+# hashed below: on any mismatch the vendor modules are used unchanged.
+TOUCH_VENDOR=/vendor/lib/modules
+AD_SHA=e824f57549c25f920ceb6aa7a9e982cc238d375b94273b93bb2872156d1e14d4
+FTS_SHA=7098b0b2d2a824f4f06689784ecfb5fc32e2defe8b2c79ffba22ffc294ccaed9
+if [ -f "$MODDIR/files/adaptive-ts.ko" ] && [ -f "$MODDIR/files/focaltech_ft3683g.ko" ]; then
+    ad_sum="$(sha256sum "$TOUCH_VENDOR/adaptive-ts.ko" 2>/dev/null | cut -d' ' -f1)"
+    fts_sum="$(sha256sum "$TOUCH_VENDOR/focaltech_ft3683g.ko" 2>/dev/null | cut -d' ' -f1)"
+    if [ "$ad_sum" = "$AD_SHA" ] && [ "$fts_sum" = "$FTS_SHA" ]; then
+        for ko in adaptive-ts focaltech_ft3683g; do
+            chmod 0644 "$MODDIR/files/$ko.ko" 2>/dev/null
+            chcon u:object_r:vendor_file:s0 "$MODDIR/files/$ko.ko" 2>/dev/null
+        done
+        # focaltech holds adaptive_ts, so it has to go first in both directions.
+        rmmod focaltech_ft3683g 2>/dev/null
+        rmmod adaptive_ts 2>/dev/null
+        if insmod "$MODDIR/files/adaptive-ts.ko" 2>/dev/null; then
+            log "touch: adaptive-ts patched build loaded"
+        else
+            insmod "$TOUCH_VENDOR/adaptive-ts.ko" 2>/dev/null &&
+                log "touch: adaptive-ts FAILED, vendor copy loaded"
+        fi
+        if insmod "$MODDIR/files/focaltech_ft3683g.ko" 2>/dev/null; then
+            log "touch: focaltech patched build loaded"
+        else
+            insmod "$TOUCH_VENDOR/focaltech_ft3683g.ko" 2>/dev/null &&
+                log "touch: focaltech FAILED, vendor copy loaded"
+        fi
+    else
+        log "touch: vendor modules changed, stock drivers kept"
+    fi
+fi
+
+
+# --------------------------------- 1d. Skip the vendor pre-flight stub
+# In this vendor build the challenge pre-flight is NOT implemented: the library
+# logs "No implement fp_verify_enroll_challenge" and returns an uninitialised
+# code, so its error branch aborts every enroll. The code is not stable either
+# (observed -1805537232, -1004, ...) - there is nothing to match on, which is why
+# the patch is a plain nop and not a narrow one (NOTICE.md, "The vendor pre-flight
+# patch").
 #
 #   silfp_enroll_enroll, vaddr 0x3645c (file offset 0x2f45c)
 #     37f80220  tbnz w0, #0x1f, <error handler>
-#     d503201f  nop
+#     1f2003d5  nop     (what this script writes)
 #
-# That NOP also swallows a genuine TA error on the same path, so it is a
-# residual risk, not a feature. What the module must NOT do (review F-003) is
-# ship a pre-patched copy of one vendor build and mount it blind: on any other
-# vendor revision the four bytes land in an unrelated instruction.
+# Nothing else in the function changes, and the cave at 0xe008 is no longer
+# reachable: it is still written because the guard verifies that region is
+# zero-filled, but nothing branches to it.
+#
+# What the module must NOT do (review F-003) is ship a pre-patched copy of one
+# vendor build and mount it blind: on any other vendor revision the four bytes
+# land in an unrelated instruction.
 #
 # Here the device patches ITSELF: copy /vendor/lib64/libsl_fp_impl.so, verify the
-# patch site, patch the copy, mount the copy. Any mismatch means "no patch":
-# enroll then fails with HW_UNAVAILABLE while authenticate keeps working, and the
-# reason is one line in the log.
+# site and the free cave, patch the copy, mount the copy. Any mismatch means "no
+# patch": enroll then fails with HW_UNAVAILABLE while authenticate keeps working,
+# and the reason is one line in the log.
 VENDOR_LIB=/vendor/lib64/libsl_fp_impl.so
 ENGINE_DIR="$RUN/engine"
 ENGINE_LIB="$ENGINE_DIR/libsl_fp_impl.so"
 PATCH_OFFSET=$((0x2f45c))
 PATCH_BEFORE="2002f837"   # file bytes of tbnz w0, #0x1f (word 0x37f80220)
+# 1f2003d5 = nop: the stub's error branch is not taken. The cave below is dead
+# code until someone branches to it; it is kept so the guard keeps proving the
+# region is free space in this vendor build.
 PATCH_AFTER="1f2003d5"
+CAVE_OFFSET=$((0xe008))   # VA 0x15008
+CAVE_SIZE=$((0x14))       # 20 bytes: mov/movk/cmp/b.eq/b
+CAVE_AFTER="09069652298cb2721f00096b60a2105423850014"
 
 hex_at() {
-    od -An -tx1 -j "$2" -N 4 "$1" 2>/dev/null | tr -d ' \n'
+    od -An -v -tx1 -j "$2" -N "${3:-4}" "$1" 2>/dev/null | tr -d ' \n'
 }
 
 patch_engine_lib() {
@@ -221,6 +270,21 @@ patch_engine_lib() {
         rm -f "$ENGINE_LIB" 2>/dev/null
         return 1
     fi
+    cave_before=$(hex_at "$ENGINE_LIB" "$CAVE_OFFSET" "$CAVE_SIZE")
+    if [ "${#cave_before}" -ne $((CAVE_SIZE * 2)) ] || [ -n "${cave_before%%0*}" ]; then
+        log "engine: ОТКАЗ: пещера не свободна (0xe008='$cave_before')"
+        rm -f "$ENGINE_LIB" 2>/dev/null
+        return 1
+    fi
+    # Cave first, site after the cave has verified.
+    printf '\011\006\226\122\051\214\262\162\037\000\011\153\140\242\020\124\043\205\000\024' | \
+        dd of="$ENGINE_LIB" bs=1 seek="$CAVE_OFFSET" conv=notrunc 2>/dev/null
+    cave_after=$(hex_at "$ENGINE_LIB" "$CAVE_OFFSET" $((${#CAVE_AFTER} / 2)))
+    if [ "$cave_after" != "$CAVE_AFTER" ]; then
+        log "engine: ОТКАЗ: пещера не записалась (0xe008='$cave_after')"
+        rm -f "$ENGINE_LIB" 2>/dev/null
+        return 1
+    fi
     printf '\037\040\003\325' | dd of="$ENGINE_LIB" bs=1 seek="$PATCH_OFFSET" conv=notrunc 2>/dev/null
     after=$(hex_at "$ENGINE_LIB" "$PATCH_OFFSET")
     if [ "$after" != "$PATCH_AFTER" ]; then
@@ -228,7 +292,8 @@ patch_engine_lib() {
         rm -f "$ENGINE_LIB" 2>/dev/null
         return 1
     fi
-    log "engine: библиотека устройства скопирована и пропатчена (сайт сверен: $before -> $after)"
+    log "engine: библиотека скопирована, сайт $before -> $after, заглушка проверки пропущена"
+    log "engine: пещера 0xe008 записана, но недостижима (ветки на неё больше нет)"
     return 0
 }
 
@@ -421,7 +486,6 @@ stop vendor.fps_hal 2>/dev/null
 
 # ------------------------------------------------------------ 4. Permissions
 chmod 0755 "$MODDIR/files/fp_hal" 2>/dev/null
-chmod 0755 "$MODDIR/files/trantp_probe" 2>/dev/null
 chmod 0755 "$MODDIR/service.sh" "$MODDIR/post-fs-data.sh" "$MODDIR/uninstall.sh" 2>/dev/null
 
 # The HAL runs as `user system` under init, so it cannot create its own instance

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 
 #include "hbm.h"
 
@@ -89,10 +89,6 @@ constexpr const char* kBacklightNode = "/sys/class/leds/lcd-backlight/brightness
 
 // Positive: the panel is lit. Zero: asleep or dozing. Negative: unreadable.
 
-// Dark-listening mode: the HAL itself holds this wakelock and drives the
-// backlight to 0, so the panel looks off while the touch controller stays in
-// ACTIVE mode and keeps reporting touches. In that state backlight==0 means
-// "intentionally dark", not "panel asleep".
 
 int readBacklightLevel() {
     const int fd = ::open(kBacklightNode, O_RDONLY | O_CLOEXEC);
@@ -229,19 +225,50 @@ void HbmController::armDeadlineLocked(Clock::time_point deadline) {
     guard_cv_.notify_all();
 }
 
+namespace {
+
+// A write during the panel's wake sequence leaves a bright rolling band across
+// the display; the same write on a settled panel is clean (measured on the
+// device). Zero backlight means asleep or dozing, so wait for the panel to light
+// and then let a few frames pass. Aborts on shutdown or a newer epoch.
+constexpr int64_t kPanelSettleMs = 180;
+constexpr int64_t kPanelWaitMaxMs = 800;
+constexpr int64_t kPanelPollMs = 10;
+
+bool waitForSettledPanel(const std::atomic<bool>& shutting_down,
+                         const std::atomic<uint64_t>& epoch_now, uint64_t epoch) {
+    if (readBacklightLevel() > 0) {
+        return true;  // already lit: this is not the wake path
+    }
+    int64_t lit_at = 0;
+    const int64_t started = steadyNowMs();
+    while (steadyNowMs() - started < kPanelWaitMaxMs) {
+        if (shutting_down.load(std::memory_order_acquire) ||
+            epoch_now.load(std::memory_order_acquire) != epoch) {
+            return false;
+        }
+        const int64_t now = steadyNowMs();
+        if (lit_at == 0 && readBacklightLevel() > 0) {
+            lit_at = now;
+        }
+        if (lit_at != 0 && now - lit_at >= kPanelSettleMs) {
+            return true;
+        }
+        ::usleep(kPanelPollMs * 1000);
+    }
+    return true;  // never lit: let the write run, the readback still rejects it
+}
+
+}  // namespace
+
 bool HbmController::applyOn(uint64_t epoch) {
 
-    // nothing at all (no node write, no uevent), so an experiment can tell whether
-    // the vendor engine lights the panel by itself.
-    // The first arm after the HAL woke the panel must not race the panel's own
-    // wake sequence: writing HBM in the middle of it leaves a horizontal band
-    // until the next frame. The flag is consumed once per wake, so later arms in
-    // the same wake stay immediate.
-    // The panel reports zero backlight while it is asleep or dozing, and driving
-    // HBM in that window leaves a bright moving band across the display. The old
-    // "wait for the panel to wake" gate was driven by noteDisplayWoke(), which
-    // nothing ever called, so the wait never ran; it is gone instead of pretending
-    // to protect anything (review H-16). applyOn already verifies the write.
+    // The panel's own wake sequence must finish before HBM is armed, otherwise
+    // the flash leaves a bright rolling band until the next frame. This waits
+    // outside io_mutex_, so requestOff and shutdown are never blocked by it.
+    if (!waitForSettledPanel(shutting_down_, epoch_, epoch)) {
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lock(io_mutex_);
         if (shutting_down_.load(std::memory_order_acquire) ||
@@ -343,11 +370,10 @@ void HbmController::applyOffNormal() {
     // the brightness write fails below.
     uevent_.sendFullHbmClear();
 
-    // Always write. "The backlight is 0, so the driver already reset the node" was
-    // wrong: hold mode zeroes the backlight itself, so the panel stayed in HBM and
-    // the sensor area kept glowing after the unlock (measured: node 0xOK, log
-    // "hbm: off by panel sleep"). A write on a sleeping panel is ignored by the
-    // driver, which costs nothing.
+    // Always write. Skipping the write when the backlight was zero ("the driver reset
+    // the node itself") left the panel in HBM with the sensor area glowing after an
+    // unlock (measured: node 0xOK, log "hbm: off by panel sleep"). A write on a
+    // sleeping panel is ignored by the driver, so it costs nothing.
 
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (!ensureNodeLocked()) {

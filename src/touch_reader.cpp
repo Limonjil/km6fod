@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 
 #include "touch_reader.h"
 
@@ -392,7 +392,7 @@ void TouchReader::loop() {
                     default:
                         break;
                 }
-            } else if (ev.type == EV_KEY && ev.code == kFodKeyCode) {
+            } else if (ev.type == EV_KEY && isFodKeyCode(ev.code)) {
                 // FOD wake gesture from the touch controller (see the header).
                 if (fod_callback_) {
                     fod_callback_(ev.value != 0);

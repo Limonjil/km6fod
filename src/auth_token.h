@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 //
 // Conversion between the AIDL HardwareAuthToken and the 69-byte packed
 // hw_auth_token_t the vendor engine expects.

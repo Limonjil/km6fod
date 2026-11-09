@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 
 #include "executors.h"
 
@@ -30,7 +30,7 @@ void CallbackDispatcher::stop() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         running_ = false;
-        queue_.clear();
+        // Queued work still runs: the loop drains before it returns.
         local = std::move(thread_);
     }
     cv_.notify_all();
@@ -81,7 +81,7 @@ void CallbackDispatcher::loop() {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this] { return !running_ || !queue_.empty(); });
-            if (!running_) {
+            if (queue_.empty()) {
                 return;
             }
             task = std::move(queue_.front());
@@ -112,7 +112,7 @@ void SerialWorker::stop() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         running_ = false;
-        queue_.clear();
+        // Queued work still runs: the loop drains before it returns.
         local = std::move(thread_);
     }
     cv_.notify_all();
@@ -157,7 +157,7 @@ void SerialWorker::loop() {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this] { return !running_ || !queue_.empty(); });
-            if (!running_) {
+            if (queue_.empty()) {
                 return;
             }
             task = std::move(queue_.front());

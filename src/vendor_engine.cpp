@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 
 #include "vendor_engine.h"
 
@@ -7,7 +7,6 @@
 
 #include <array>
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
 
 #include "logging.h"
@@ -84,6 +83,10 @@ VendorEngine::Slot VendorEngine::slot(size_t offset) const {
     if (device_ == nullptr || !known) {
         return nullptr;
     }
+    // The vendor object is an array of function pointers with a fixed stride; the
+    // slots above come from its disassembly (review H-25 limited this to known
+    // offsets). The cast is unavoidable because the layout is the vendor's ABI and
+    // no header declares it - libsl_fp_impl.so exposes no struct type (review H-53).
     return reinterpret_cast<void**>(device_)[offset / sizeof(void*)];
 }
 
@@ -126,6 +129,46 @@ bool VendorEngine::loadEngineSymbolsLocked() {
 }
 
 bool VendorEngine::open() {
+    // The device itself is guarded by device_mutex_, but the open sequence must
+    // not run under it: dlopen plus the vendor open() can block for a long time,
+    // and every shared-lock caller (isOpen, notify*, sendTouchInfo, cancel)
+    // would wait behind it. A separate gate lets exactly one attempt run while
+    // the others wait for its outcome - including its failure, which previously
+    // made each queued caller repeat the whole sequence (review H-23).
+    std::unique_lock<std::mutex> gate(open_mutex_);
+    if (open_state_ == OpenState::kOpen) {
+        return true;
+    }
+    if (open_state_ == OpenState::kOpening) {
+        const uint64_t epoch = open_epoch_;
+        open_cv_.wait(gate, [this, epoch] { return open_epoch_ != epoch; });
+        return open_state_ == OpenState::kOpen;
+    }
+    open_state_ = OpenState::kOpening;
+    gate.unlock();
+
+    const bool opened = openDevice();
+
+    gate.lock();
+    // A close() that ran while the attempt was in flight already published
+    // kClosed; re-publishing kOpen here would claim a device that close() has
+    // released. Only an untouched attempt may announce itself as open.
+    const bool still_ours = open_state_ == OpenState::kOpening;
+    open_state_ = (opened && still_ours) ? OpenState::kOpen : OpenState::kClosed;
+    ++open_epoch_;
+    gate.unlock();
+    open_cv_.notify_all();
+
+    if (!opened) {
+        return false;
+    }
+    // Diagnostic only; never gate a capture on it.
+    int status = 0;
+    probeSpi(&status);
+    return true;
+}
+
+bool VendorEngine::openDevice() {
     std::unique_lock<std::shared_mutex> lock(device_mutex_);
     if (device_ != nullptr) {
         return true;
@@ -201,15 +244,21 @@ bool VendorEngine::open() {
         LOGE("engine: set_active_group slot is null");
     }
 
-    lock.unlock();
-
-    // Diagnostic only; never gate a capture on it.
-    int status = 0;
-    probeSpi(&status);
     return true;
 }
 
 void VendorEngine::close() {
+    // Publish the closed state before the device goes away: a concurrent open()
+    // then takes the slow path and blocks on device_mutex_ instead of being
+    // told "open" while the sensor is already released. Nothing holds
+    // open_mutex_ while waiting for device_mutex_, so this order cannot deadlock.
+    {
+        std::lock_guard<std::mutex> gate(open_mutex_);
+        open_state_ = OpenState::kClosed;
+        ++open_epoch_;
+    }
+    open_cv_.notify_all();
+
     std::unique_lock<std::shared_mutex> lock(device_mutex_);
     if (device_ == nullptr) {
         return;

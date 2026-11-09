@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 //
 // Touch reporting for the under-display sensor.
 //
@@ -33,11 +33,12 @@ class TouchReader {
     using Callback = std::function<void(int x, int y, bool down)>;
 
     // FOD wake gesture from the touch controller: the driver reports EV_KEY with
-    // code 0xbe (KEY_F20) when the sensor zone is pressed while the panel is off.
-    // This is the only way to learn about the touch before the display wakes.
+    // code 0xbe (KEY_F20, gesture id 37) or 0xb7 (KEY_F13, gesture id 36 -> 0xcc)
+    // when the sensor zone is pressed while the panel is off. This is the only way
+    // to learn about the touch before the display wakes.
     using FodCallback = std::function<void(bool down)>;
 
-    static constexpr int kFodKeyCode = 0xbe;
+    static constexpr bool isFodKeyCode(int code) { return code == 0xbe || code == 0xb7; }
 
     TouchReader() = default;
     ~TouchReader();

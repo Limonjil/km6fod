@@ -13,9 +13,7 @@
 MODDIR=${0%/*}
 LOGFILE=/data/adb/km6fod.log
 VENDOR_HAL=/vendor/bin/hw/android.hardware.biometrics.fingerprint@2.1-service-mediatek
-# The HAL owns /data/adb/km6fod/run (lock, hold_off, templates marker). Both sides
-# must agree on it: writing hold_off to the module directory meant the HAL's signal
-# went into a directory the helper never read (review H-32).
+# One runtime directory, owned by the HAL; every script must use it (review H-32).
 RUN="/data/adb/km6fod/run"
 PIDFILE="$RUN/fp_hal.pid"
 SUPERVISOR_LOCK="$RUN/supervisor.lock"
@@ -67,59 +65,8 @@ stop vendor.tran_fps_hal 2>/dev/null
 stop vendor.fps_hal 2>/dev/null
 sleep 1
 
-# --------------------------------------------------- FOD wake gesture (screen off)
-# The touch controller reports a finger on the sensor zone even with the panel
-# off, but the driver drops it until the gesture is enabled. On stock the vendor
-# framework asks the touch HAL to do it; on a GSI nobody does. The helper talks
-# to vendor.hardware.trantp.ITrantp/default and calls opration(3, "fp1"), which
-# writes "fp1" to /proc/gesture_state exactly like the stock framework does.
-# After that the controller emits EV_KEY 0xbe on /dev/input/event5 for every press.
-enable_fod_gesture() {
-    # Two independent switches, both required:
-    #   1. `/proc/gesture_state` via the vendor service - puts the controller into
-    #      gesture mode, so it keeps scanning while the panel is off.
-    #   2. `/proc/gesture_function` - sets the per-gesture enable bit inside the
-    #      driver's `gesture_maps` table. Without it the driver recognises the
-    #      touch, translates it to 0xbe and then discards it with
-    #      "Sorry, this gesture has been disabled" (GestureHandle).
-    if [ -x "$MODDIR/files/trantp_probe" ]; then
-        if "$MODDIR/files/trantp_probe" 2 3 fp1 >/dev/null 2>&1; then
-            log "FOD wake gesture enabled (ITrantp opration 3)"
-        else
-            log "FOD wake gesture NOT enabled (ITrantp)"
-        fi
-    fi
-    if [ -w /proc/gesture_function ]; then
-        if echo fp1 > /proc/gesture_function 2>/dev/null; then
-            log "FOD wake gesture enabled (gesture_function fp1)"
-        else
-            log "FOD wake gesture NOT enabled (gesture_function)"
-        fi
-    fi
-}
-
-# The display wake is injected by the HAL itself through /dev/uinput: that is
-# the only path that works here. `cmd input` returns "Failed transaction" for
-# a child of the HAL, and a helper started from this script runs in the Magisk
-# domain, where the same command blocks instead of waking anything.
-
-# --------------------------------------------------------------- hold mode
-# Recover the panel if a previous run died while hold mode had it at zero: the
-# write only lands on an interactive display, which is the state we start in.
-echo 723 > /sys/class/leds/lcd-backlight/brightness 2>/dev/null
-settings put system screen_brightness 45 2>/dev/null
-
-# Keeps the display interactive with zero backlight while locked (one process).
-HOLD_PID="$RUN/hold.pid"
-if [ -f "$HOLD_PID" ] && kill -0 "$(cat "$HOLD_PID" 2>/dev/null)" 2>/dev/null; then
-    :
-else
-    if [ -x "$MODDIR/hold.sh" ]; then
-        nohup sh "$MODDIR/hold.sh" >> "$LOGFILE" 2>&1 &
-        echo $! > "$HOLD_PID"
-        log "hold: helper started (pid $!)"
-    fi
-fi
+# Recover the panel if a previous run left the backlight at zero: the write only
+# lands on an interactive display, which is the state we start in.
 
 # ------------------------------------------------------------ supervision
 # A pid file only tells us a process exists, not that it is our HAL. After a
@@ -153,9 +100,7 @@ while true; do
 
     if kill -0 "$pid" 2>/dev/null; then
         # It survived the first seconds: reset the backoff and (re)assert the
-        # wake gesture, which the driver does not keep across a restart.
         delay=2
-        enable_fod_gesture
     else
         # Report how it ended, not just that it ended (review F-011): without the
         # wait status every crash looks identical in the log.

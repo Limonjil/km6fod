@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 //
 // Two small execution helpers shared by the HAL.
 //
@@ -14,7 +14,9 @@
 //     exhaust it, stalling the whole biometric scheduler.
 //
 // Lifecycle contract: Running -> Stopping -> Stopped. start()/stop() are
-// serialised, stop() is idempotent, and a thread may not join itself.
+// serialised, stop() is idempotent, and a thread may not join itself. stop()
+// refuses new work, runs what is already queued, then joins: a dropped task is
+// a callback the framework waits for until its own timeout (review H-31).
 
 #pragma once
 

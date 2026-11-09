@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 //
 // Service entry point for the KM6 AIDL fingerprint HAL.
 //
@@ -154,6 +154,7 @@ int main() {
     (void)lock_fd;  // held for the process lifetime
 
     installSignalHandling();
+    km6fod::wakeKeyInit();
 
     LOGI("main: starting KM6 FOD HAL");
 

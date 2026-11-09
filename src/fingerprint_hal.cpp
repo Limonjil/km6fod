@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-only
 
 #include "fingerprint_hal.h"
 
@@ -84,11 +84,15 @@ void FingerprintHal::stop() {
         session->shutdown();
     }
 
-    // Drain in-flight vendor calls before closing the device. Closing first
-    // would let a queued remove/enumerate call run on a freed vendor object.
-    worker_.stop();
-    timers_.stop();
+    // Drain in order: the dispatcher first, because its queued callbacks may
+    // still hand work to the worker; then the timer queue; then the worker,
+    // which is what actually drains in-flight vendor calls. Closing the device
+    // before the worker drained would let a queued remove/enumerate run on a
+    // freed vendor object, and stopping the worker first dropped the callbacks
+    // the framework was still waiting for (review H-31).
     dispatcher_.stop();
+    timers_.stop();
+    worker_.stop();
 
     HbmController::instance().requestOff();
     HbmController::instance().stop();
