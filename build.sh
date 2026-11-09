@@ -162,7 +162,7 @@ compile_one() {
 pids=()
 running=0
 # Cap the parallelism: with 16 jobs the NDK .cmd wrappers intermittently
-# fail with "no such file or directory" on random sources (see DEBUG.md F22).
+# fail with "no such file or directory" on random sources.
 max_jobs="$(nproc 2>/dev/null || echo 4)"
 [ "$max_jobs" -gt 4 ] && max_jobs=4
 for source in "${SOURCES[@]}"; do

@@ -125,7 +125,7 @@ std::atomic<int64_t> g_last_wake_ms{0};
 // comes up (measured: pre-light 25.124 -> authenticate 26.402). Illumination must
 // therefore survive that gap instead of closing as soon as the operation is still
 // missing, which is what left every dark-screen press with a 0.2 s flash and no
-// unlock (DEBUG.md F27).
+// unlock.
 bool wakeInFlight() {
     const int64_t t = g_last_wake_ms.load(std::memory_order_acquire);
     return t != 0 && monotonicMs() - t < 2500;
@@ -227,7 +227,7 @@ void wakeDisplay(bool force = false) {
     // (tran_fp -> do_wakeup_set) brings the SoC up, and the virtual KEY_WAKEUP
     // below makes the display interactive so SystemUI draws the keyguard and
     // creates the authenticate operation. Key injection also launched the camera
-    // on this build once (see DEBUG.md, F12); that happened with EV_KEY 0xb7 on
+    // on this build once; that happened with EV_KEY 0xb7 on
     // the real touch device, not with a separate KEY_WAKEUP device.
     // Cached: this used to open and read the sysfs node on every idle touch sample,
     // up to a hundred times per second on the reader (review H-15).
@@ -1322,7 +1322,7 @@ void Session::continueFodPress() {
     // window if no capture arrives, and the normal path takes over when it does.
     // Light ahead only when someone can receive the result: a live operation, or a
     // UI that reported ready within the window. Without this the sensor lit up for
-    // an operation that did not exist - "light on, no unlock" (DEBUG.md F27).
+    // an operation that did not exist - "light on, no unlock".
     const State st = state_.load(std::memory_order_acquire);
     const bool op_live =
         st == State::kAuthenticating || st == State::kEnrolling || uiReadyValid();

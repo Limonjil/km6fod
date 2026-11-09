@@ -16,8 +16,8 @@ licensed GPL-3.0-only (see the SPDX headers in `src/` and `LICENSE`).
 | `third_party/aidl_api/android17-release/*.aidl` | AOSP, same package, frozen API versions 1-5, fetched from `android.googlesource.com` | Apache-2.0 | no — reference only, for the Android 16/17 work |
 | `third_party/syslibs/arm64-v8a/libbinder_ndk.so` | pulled from the device (`/system/lib64`), used only for linking | AOSP, Apache-2.0 | no |
 | `overlay/*/build/*.apk` | built from the manifests in this tree, signed with the public AOSP platform test key | — | the signed APKs are shipped as `system/product/overlay/**` |
-| `analysis/adaptive-ts.ko`, `analysis/touch-driver/focaltech_ft3683g.ko`, `backups/*.img` | stock Tecno/MediaTek firmware artifacts | proprietary, Tecno/MediaTek terms | no (analysis copies only) |
-| `analysis/touch-driver/*.patched.ko` | the same two vendor modules with four bytes changed (see `PANEL-RE-LEDGER.md`, T1); kept as analysis artifacts only — the module ships no kernel modules and loads none | proprietary, Tecno/MediaTek terms — not licensed for redistribution | no (not shipped) |
+| `backups/*.img` | stock Tecno/MediaTek firmware dumps | proprietary, Tecno/MediaTek terms | no (local backups only, not in git) |
+| `magisk_module/files/{adaptive-ts.ko,focaltech_ft3683g.ko}` | the device's own touch modules (`/vendor/lib/modules`), with four bytes changed: adaptive-ts at file offset `0x88d0` (skip the vendor suspend command), focaltech at `0x1c80`, `0x90bc`, `0x1db0` (keep scanning, do not arm the gesture mode, do not set the suspended flag) | proprietary, Tecno/MediaTek terms — not licensed for redistribution | yes, loaded at boot; `post-fs-data.sh` checks the stock sha256 first and falls back to the untouched vendor modules on any mismatch |
 
 ## What is deliberately not here anymore
 

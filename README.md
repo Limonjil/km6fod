@@ -13,6 +13,16 @@ This implementation is clean-room: it was written from the architecture
 specification and observations made on the live device. No code or assets were
 taken from any other fingerprint module.
 
+Two things go beyond the HAL. With the display off the vendor touch controller is
+put into gesture mode by its driver, so no multitouch reaches the HAL at all; the
+module therefore loads the device's own `adaptive-ts.ko` and
+`focaltech_ft3683g.ko` with four bytes changed, after checking their stock
+sha256 and with a fallback to the untouched vendor copies. And because a plain
+kernel wakelock raises the SoC without making the display interactive (SystemUI
+then never creates the `authenticate` operation), the HAL owns a virtual
+`KEY_WAKEUP` device through `/dev/uinput` and presses it on a dark-screen touch.
+See `NOTICE.md` for the licensing status of those two vendor binaries.
+
 ---
 
 ## 1. The blocker, and why this design

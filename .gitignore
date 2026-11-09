@@ -6,3 +6,4 @@ debug-evidence/
 debug-evidence$T-*
 *.log
 .metrics/
+patched/
