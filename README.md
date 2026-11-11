@@ -42,7 +42,8 @@ On stock firmware the panel driver raises it through `tran_fp.ko`
 The engine replaces embedded NULs with spaces and performs a `strstr()` over a
 `NETLINK_KOBJECT_UEVENT` datagram. A datagram injected from userspace into
 multicast group 1 is therefore indistinguishable from a kernel event. This module
-uses that path; no kernel change and no binary patching are required.
+uses that path. (The vendor library and the two touch modules *are* adjusted
+elsewhere — see `NOTICE.md` — but nothing on this path needs either.)
 
 Verified on device: after injection the engine logs
 
@@ -327,9 +328,9 @@ Do **not** repeatedly force HBM on with `echo 1` while debugging: use the HAL or
 
 - Multi-user is implemented (`set_active_group` per session user) but only user 0
   was exercised on hardware.
-- The UDFPS SystemUI overlays (`config_udfps_sensor_props`, `pixel_pitch`) are
-  **not** shipped here. They are required for correct ring rendering; provide them
-  separately if the GSI lacks them.
+- The UDFPS SystemUI overlay (`pixel_pitch`) **is** shipped
+  (`system/product/overlay/KM6SuiUdfps`); the sensor-props/geometry values it
+  pins are those measured on this panel, so another panel needs its own overlay.
 - The vendor ABI is private: the vtable offsets and the 69-byte token are pinned
   with `static_assert`/runtime checks but can change with a vendor library update.
 - The uevent injection relies on the engine's substring test. A vendor library
@@ -338,9 +339,11 @@ Do **not** repeatedly force HBM on with `echo 1` while debugging: use the HAL or
   userspace. The independent guard, the `sigwait` force-off, and the supervisor's
   `wait`+reset are the layers that bound the damage; a hard kernel lockup still
   requires a reboot.
-- The VINTF manifest declares `<version>2</version>`, which is what this GSI
-  accepted in testing. The system compatibility matrix also lists 3–4; do not
-  change the declared version without re-testing service discovery.
+- The VINTF fragment no longer carries a hand-written version: `post-fs-data.sh`
+  takes the highest bound for this HAL from
+  `/system/etc/vintf/compatibility_matrix*.xml` and clamps it to the implemented
+  interface version (5), which is 4 on this Android 15 GSI and 5 on 16/17.
+  Editing the fragment by hand is neither needed nor allowed.
 
 ---
 
@@ -363,8 +366,9 @@ Do **not** repeatedly force HBM on with `echo 1` while debugging: use the HAL or
 | Android 15 (API 35) | **checked** | this device, `dumpsys fingerprint` shows the sensor running and unlocking |
 | Android 16 / 17 | **built for, not verified** | the HAL is compiled from AOSP `android17-release` AIDL at interface version 5 (the band Android 16 and 17 require is 3-5), and the VINTF fragment takes its declared version from the device's own compatibility matrix. No A16/A17 image was available to run it |
 | Magisk 27+ | **checked** (31.1 here) | module installs and the boot path runs |
-| KernelSU | **not supported** | no `magiskpolicy`; the rules in `sepolicy.rule` address the Magisk domain. `post-fs-data.sh` detects the manager and says so in the log |
-| APatch | **not tested** | it provides `magiskpolicy`, so it may work; nothing was verified |
+| KernelSU | **supported, not device-verified** | `customize.sh` installs the `ksu` variant of the policy (`sepolicy.rule.ksu`) because KernelSU has no `magisk` type, and `post-fs-data.sh` mounts the two RROs itself with overlayfs when the manager does not mount `system/` (no metamodule). No KernelSU device was available to boot it; the gate leaves the stock provider running if any step does not land |
+| APatch | **supported, not device-verified** | same zip, `magiskpolicy` and the `magisk` domain, as in Magisk. Nothing was verified on hardware |
+| SELinux enforcing | **not checked** | on this device the domain the HAL runs in is permissive, which hides a missing rule. `post-fs-data.sh` now probes `/dev/mobicore-user` and the HBM node with `access()` and refuses the swap (stock provider stays) when they are denied, so a gap shows up as "module did not start", not as a silent half-working sensor |
 | 4 KB pages | **checked** | `getconf PAGE_SIZE` = 4096 |
 | 16 KB pages | **not checked** | all shipped ELFs are 16 KB aligned and `build_module.sh` refuses to package one that is not, but no 16 KB device was available |
 | SELinux enforcing | **partially** | the domain this HAL runs in (`u:r:su:s0`) is permissive on Magisk. The rules were written for a confined domain; on an enforcing-manager they are what would decide whether it works |

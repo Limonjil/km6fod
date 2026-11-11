@@ -1613,8 +1613,16 @@ void Session::onTouchEvent(int x, int y, bool down) {
             }
             if (capturing && !illuminationQuarantined() &&
                 (panelBacklightLevel() == 0 || !HbmController::instance().isOn())) {
-                LOGI("session: pre-lighting before the overlay");
-                HbmController::instance().requestOn();
+                // Engaging HBM waits on the panel for up to kRequestTimeoutMs.
+                // On the evdev reader that overflowed the 64-event buffer and
+                // turned into a silent SYN_DROPPED (review F-006), so the wait
+                // belongs on the serial worker like every other engine call.
+                const std::weak_ptr<Session> weak_lit = self_;
+                postToWorker([weak_lit] {
+                    if (auto self = weak_lit.lock()) {
+                        HbmController::instance().requestOn();
+                    }
+                });
                 const std::weak_ptr<Session> weak_pre = self_;
                 timers_.scheduleAfter(std::chrono::milliseconds(2500), [weak_pre] {
                     auto self = weak_pre.lock();
@@ -1697,18 +1705,30 @@ void Session::onTouchEvent(int x, int y, bool down) {
         // not just the first one of a press. Arming only on the first sample made
         // every later one powerless to relight a window that had closed for any
         // reason - the "lights up only sometimes" the user kept hitting.
-        // The first sample of a press applies the window on this thread because
-        // the next statement tells the engine the finger is down and its capture
-        // starts immediately; requestIllumination() only queues the work, and the
-        // TA then rejects a frame taken in the dark. Later samples can be queued.
+        // Arming the window waits on the panel for up to kRequestTimeoutMs, and
+        // the reader must keep draining evdev meanwhile: the 64-event buffer
+        // covers ~10 frames, and an overflow used to end in a silent
+        // SYN_DROPPED (review F-006). The light still has to be on before the
+        // engine hears the finger, so the whole tail of the first sample of a
+        // press is one worker task; later samples only forward the coordinates.
         if (!HbmController::instance().isOn()) {
             if (fresh_down && !illuminationQuarantined()) {
-                if (HbmController::instance().requestOn()) {
-                    VendorEngine::instance().notifyUiReady(1);
-                }
-            } else {
-                requestIllumination(/*allow_wake=*/false);
+                const std::weak_ptr<Session> weak_dn = self_;
+                postToWorker([weak_dn, x, y] {
+                    auto inner = weak_dn.lock();
+                    if (!inner || inner->closed_.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    if (HbmController::instance().requestOn()) {
+                        VendorEngine::instance().notifyUiReady(1);
+                    }
+                    LOGI("session: finger down, illumination requested");
+                    VendorEngine::instance().syncFingerStatusOptic(true);
+                    VendorEngine::instance().sendTouchInfo(x, y);
+                });
+                return;
             }
+            requestIllumination(/*allow_wake=*/false);
         }
 
         if (fresh_down) {
@@ -1944,7 +1964,7 @@ void Session::finishChallenge() {
     return ::ndk::ScopedAStatus::ok();
 }
 
-void Session::startEnumerate() {
+void Session::startEnumerate(std::vector<int32_t> verify_removal) {
     if (closed_.load(std::memory_order_acquire)) {
         emitEnrollmentsEnumerated({});
         return;
@@ -1960,6 +1980,7 @@ void Session::startEnumerate() {
         enum_started_ms_ = monotonicMs();
         enum_last_notice_ms_ = enum_started_ms_;
         enumerated_.clear();
+        enum_remove_pending_ = std::move(verify_removal);
     }
 
     const std::weak_ptr<Session> weak = self_;
@@ -2062,14 +2083,17 @@ void Session::enumerateSettle(uint64_t generation) {
 
 void Session::finishEnumerate(uint64_t generation, std::vector<int32_t> ids,
                                bool authoritative) {
+    std::vector<int32_t> pending;
     {
         std::lock_guard<std::mutex> lock(enum_mutex_);
         if (generation == enum_generation_) {
             enum_active_ = false;
+            pending = std::move(enum_remove_pending_);
         }
     }
     const std::weak_ptr<Session> weak = self_;
-    postToUi([weak, generation, ids = std::move(ids), authoritative] {
+    postToUi([weak, generation, ids = std::move(ids), authoritative,
+              pending = std::move(pending)] {
         auto self = weak.lock();
         if (!self || self->closed_.load(std::memory_order_acquire)) {
             return;
@@ -2095,6 +2119,24 @@ void Session::finishEnumerate(uint64_t generation, std::vector<int32_t> ids,
         } else if (ids.size() == 1) {
             self->single_template_id_.store(ids.front(), std::memory_order_release);
         }
+        if (!pending.empty()) {
+            // This enumeration exists to verify a removal (F-004): report the
+            // ids that actually disappeared, and never claim a template is gone
+            // when the engine merely returned success.
+            std::vector<int32_t> vanished;
+            for (int32_t id : pending) {
+                if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+                    vanished.push_back(id);
+                }
+            }
+            if (vanished.size() != pending.size()) {
+                LOGW("session: engine kept %zu of %zu template(s) it reported as removed",
+                     pending.size() - vanished.size(), pending.size());
+            }
+            LOGI("session: removal verified, %zu of %zu gone", vanished.size(), pending.size());
+            self->emitEnrollmentsRemoved(vanished);
+            return;
+        }
         LOGI("session: enumerated %zu template(s)", ids.size());
         self->emitEnrollmentsEnumerated(ids);
     });
@@ -2115,28 +2157,36 @@ void Session::finishEnumerate(uint64_t generation, std::vector<int32_t> ids,
             if (!self || self->closed_.load(std::memory_order_acquire)) {
                 return;
             }
-            std::vector<int32_t> removed;
+            std::vector<int32_t> attempted;
             VendorEngine& engine = VendorEngine::instance();
             if (engine.open() && self->ensureUserGroup()) {
                 for (int32_t id : ids) {
                     const int32_t engine_id = engineEnrollmentId(id);
                     const int rc = engine.removeEnrollment(gid, static_cast<uint32_t>(engine_id));
                     LOGI("session: remove(%d) rc=%d", id, rc);
+                    // The vendor returns success whether or not the template is
+                    // gone (NOTICE.md), so its status proves nothing (F-004).
                     if (rc == 0) {
-                        removed.push_back(id);
+                        attempted.push_back(id);
                     }
                 }
             } else {
                 LOGE("session: removeEnrollments without a sensor");
             }
-            const std::weak_ptr<Session> inner_weak = weak;
-            self->postToUi([inner_weak, removed = std::move(removed)] {
-                auto inner = inner_weak.lock();
-                if (!inner || inner->closed_.load(std::memory_order_acquire)) {
-                    return;
-                }
-                inner->emitEnrollmentsRemoved(removed);
-            });
+            if (attempted.empty()) {
+                const std::weak_ptr<Session> inner_weak = weak;
+                self->postToUi([inner_weak] {
+                    auto inner = inner_weak.lock();
+                    if (!inner || inner->closed_.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    inner->emitEnrollmentsRemoved({});
+                });
+                return;
+            }
+            // Only what disappears is reported: a fresh enumeration decides, not
+            // the engine's return code. finishEnumerate emits the removal.
+            self->startEnumerate(std::move(attempted));
         })) {
         emitEnrollmentsRemoved({});
     }

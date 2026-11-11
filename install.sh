@@ -68,11 +68,27 @@ push_tree() {
 stop_conflicts() {
     say "== stopping this project's previous HAL/supervisor and vendor HIDL"
     "$ADB" shell 'sh -s' <<'EOF'
-for pat in "/data/adb/modules/km6fod/service.sh"; do
-    for pid in $(pgrep -f "$pat" 2>/dev/null); do kill "$pid" 2>/dev/null; done
+T=/data/adb/modules/km6fod
+V=/vendor/bin/hw/android.hardware.biometrics.fingerprint@2.1-service-mediatek
+# The HAL runs from $V (a bind mount of files/fp_hal), so its command line never
+# names the module: identity is the executable file (F-005), not the cmdline,
+# which is identical to the stock provider's. It is ours only while $V is our
+# mount; otherwise the stock HIDL binary stands behind the same path.
+is_our_hal() {
+    [ -n "$1" ] && [ -r "/proc/$1/exe" ] || return 1
+    exe=$(readlink "/proc/$1/exe" 2>/dev/null)
+    case "$exe" in
+        "$T"/files/*|/data/local/tmp/fp_hal*) return 0 ;;
+    esac
+    [ "$exe" = "$V" ] && grep -q " $V " /proc/mounts 2>/dev/null
+}
+for pid in $(pgrep -f "$T/service.sh" 2>/dev/null); do
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'km6fod/service.sh' &&
+        kill "$pid" 2>/dev/null
 done
-for pat in "/data/adb/modules/km6fod/files/fp_hal" "/data/local/tmp/fp_hal_new"; do
-    for pid in $(pgrep -f "$pat" 2>/dev/null); do kill "$pid" 2>/dev/null; done
+for pid in $(pgrep -f 'fingerprint@2.1-service-mediatek' 2>/dev/null) \
+           $(cat "$T/run/fp_hal.pid" 2>/dev/null); do
+    is_our_hal "$pid" && kill "$pid" 2>/dev/null
 done
 stop vendor.tran_fps_hal 2>/dev/null
 stop vendor.fps_hal 2>/dev/null
@@ -112,9 +128,19 @@ do_test() {
 do_install() {
     require_device
     build_zip
-    say "== installing via Magisk"
+    # Same zip everywhere; only the installer entry point differs. KernelSU and
+    # APatch refuse recovery installs, so their CLI is the only non-app path
+    # (review F-001).
+    say "== installing via the root manager on the device"
     "$ADB" push "$ZIP" /data/local/tmp/ >/dev/null
-    "$ADB" shell "magisk --install-module /data/local/tmp/$(basename "$ZIP")"
+    remote_zip="/data/local/tmp/$(basename "$ZIP")"
+    if "$ADB" shell 'command -v ksud' >/dev/null 2>&1; then
+        "$ADB" shell "ksud module install $remote_zip"
+    elif "$ADB" shell 'command -v apd' >/dev/null 2>&1; then
+        "$ADB" shell "apd module install $remote_zip"
+    else
+        "$ADB" shell "magisk --install-module $remote_zip"
+    fi
     say "Module installed. Reboot to activate."
     echo
     echo "NOTE: if another module also installs a fingerprint HAL and mounts the"

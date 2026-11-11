@@ -22,13 +22,28 @@ SUPERVISOR_LOCK="$RUN/supervisor.lock"
 # vendor linker namespace, which dlopen of the vendor engine requires. If the
 # bind mount from post-fs-data.sh is missing, starting $VENDOR_HAL would run the
 # STOCK HIDL HAL instead - the exact process this module disables. Refuse.
-HAL="$VENDOR_HAL"
-if ! grep -q " $VENDOR_HAL " /proc/mounts 2>/dev/null; then
-    log "FATAL: $VENDOR_HAL не смонтирован на наш бинарь; старт отклонён (иначе запустится стоковый HIDL HAL)"
-    stop vendor.tran_fps_hal 2>/dev/null
-    exit 1
-fi
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOGFILE" 2>/dev/null; }
+HAL="$VENDOR_HAL"
+# Leave a working provider behind instead of exiting into a device where nobody
+# owns the sensor (F-007).
+restore_stock() {
+    setprop ctl.start vendor.tran_fps_hal 2>/dev/null
+    setprop ctl.start vendor.fps_hal 2>/dev/null
+    exit 1
+}
+
+# post-fs-data.sh writes $RUN/ready only after every mount and the RRO gate
+# passed; its absence means the stock provider was never stopped and this HAL
+# must not register either.
+if [ ! -f "$RUN/ready" ]; then
+    log "FATAL: post-fs-data не подтвердил подмену (нет $RUN/ready); старт отклонён"
+    restore_stock
+fi
+
+if ! grep -q " $VENDOR_HAL " /proc/mounts 2>/dev/null; then
+    log "FATAL: $VENDOR_HAL не смонтирован на наш бинарь; старт отклонён"
+    restore_stock
+fi
 
 log "=== km6fod: service.sh ==="
 
@@ -71,11 +86,14 @@ sleep 1
 # ------------------------------------------------------------ supervision
 # A pid file only tells us a process exists, not that it is our HAL. After a
 # reboot the stored pid may belong to anything at all, and trusting it would
-# leave the sensor permanently down. Verify the command line.
+# leave the sensor permanently down. Verify what the process actually runs.
+# The pid file survives a reboot and may then name the stock HIDL provider on
+# the same path or an unrelated process: identity is the executed file (F-005),
+# not the command line, which is identical for both binaries behind $VENDOR_HAL.
 is_hal_alive() {
-    [ -n "$1" ] && [ -r "/proc/$1/cmdline" ] || return 1
-    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null |
-        grep -qE 'fingerprint@2\.1-service-mediatek|km6fod/files/fp_hal'
+    [ -n "$1" ] && [ -r "/proc/$1/exe" ] || return 1
+    exe=$(readlink "/proc/$1/exe" 2>/dev/null)
+    [ "$exe" = "$HAL" ] || [ "$exe" = "$MODDIR/files/fp_hal" ]
 }
 
 delay=2

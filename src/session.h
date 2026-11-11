@@ -223,7 +223,7 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
 
     bool ensureUserGroup();
     void requestRearm(uint64_t generation);
-    void startEnumerate();
+    void startEnumerate(std::vector<int32_t> verify_removal = {});
     void runEnumerate(uint64_t generation);
     // Timer-driven flush of the enumeration buffer (review H-12).
     void enumerateSettle(uint64_t generation);
@@ -392,6 +392,9 @@ class Session : public aidl::android::hardware::biometrics::fingerprint::BnSessi
     // it (review H-12).
     mutable std::mutex enum_mutex_;
     std::vector<int32_t> enumerated_;
+    // Non-empty when the enumeration runs to verify a removal: the ids are
+    // reported as removed only if they are absent from the result (F-004).
+    std::vector<int32_t> enum_remove_pending_;
     bool enum_active_ = false;
     bool enum_error_ = false;
     int64_t enum_started_ms_ = 0;

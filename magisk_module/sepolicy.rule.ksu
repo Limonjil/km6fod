@@ -1,0 +1,16 @@
+# KernelSU variant of sepolicy.rule. Magisk and APatch run module scripts in
+# u:r:magisk:s0; KernelSU runs them in u:r:ksu:s0 and does not define the
+# `magisk` type at all, and one undefined type makes the whole file rejected.
+# customize.sh copies this file over sepolicy.rule when KSU=true.
+allow hal_fingerprint_default ksu unix_stream_socket connectto
+allow ksu hal_fingerprint_default unix_stream_socket connectto
+allow ksu hal_fingerprint_default fd use
+allow ksu hal_fingerprint_default unix_stream_socket read
+allow ksu hal_fingerprint_default unix_stream_socket write
+allow ksu hal_fingerprint_default unix_stream_socket getattr
+
+# Trustonic TEE user node (enroll() returns HW_UNAVAILABLE without it).
+allow ksu mobicore_user_device chr_file { ioctl read write getattr open }
+
+# Kernel-object uevent injection the vendor engine blocks on (FULL_HBM_SET).
+allow ksu ksu netlink_kobject_uevent_socket { create bind setopt read write sendto }

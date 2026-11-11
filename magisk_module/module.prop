@@ -1,7 +1,7 @@
 id=km6fod
 name=KM6 Under-Display Fingerprint (AIDL HAL)
-version=v1.7.0
-versionCode=17000
+version=v1.8.0
+versionCode=18000
 author=limonjil
 license=GPL-3.0-only
-description=Silead GSL7002 under-display fingerprint for the Tecno Spark 40 Pro (KM6) on GSI. Touch the sensor on the lockscreen and the HAL wakes the panel, arms HBM after it settles and unlocks without a second tap. Self-contained AIDL v5 HAL with verified HBM readback, kernel uevent injection, serialized vendor calls, lazy sensor open, and a supervisor that resets HBM if the HAL dies. Patches the device's own libsl_fp_impl.so at boot after verifying the site; ships no kernel modules and injects no input keys. Checked on Android 15 / 4 KB / Magisk 31.1; Android 16-17 is built for but not verified, KernelSU and APatch are not supported.
+description=Silead GSL7002 under-display fingerprint for the Tecno Spark 40 Pro (KM6) on GSI. Touch the sensor on the lockscreen and the HAL wakes the panel, arms HBM after it settles and unlocks without a second tap. Self-contained AIDL v5 HAL with verified HBM readback, kernel uevent injection, serialized vendor calls, lazy sensor open, and a supervisor that resets HBM if the HAL dies. Loads the device's own touch and display modules after checking their hashes, presses a virtual KEY_WAKEUP for a dark screen, and patches the device's own libsl_fp_impl.so at boot after verifying the site. Works under Magisk, KernelSU and APatch (per-manager SELinux policy and an overlayfs fallback for managers that do not mount system/); the swap only happens when every mount, the RRO and the policy probe pass, otherwise the stock provider is left running. Checked on Android 15 / 4 KB / Magisk 31.1; Android 16-17, KernelSU and APatch are supported but not device-verified.

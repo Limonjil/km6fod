@@ -19,6 +19,8 @@ HBM=/sys/kernel/tran_display/lcm_hbm_state
 umask 077
 mkdir -p "$RUN" 2>/dev/null
 chmod 0755 "$RUN" 2>/dev/null
+# A ready marker from the previous boot must never be trusted by service.sh.
+rm -f "$RUN/ready" 2>/dev/null
 
 if ! ( : >> "$LOGFILE" ) 2>/dev/null; then
     LOGFILE=/dev/null
@@ -42,8 +44,12 @@ elif [ -x /data/adb/magisk/magisk ]; then
     MANAGER=magisk
 fi
 log "manager: $MANAGER"
+# KernelSU has no `magisk` type and mounts system/ only through a metamodule,
+# so customize.sh installed the ksu policy and the overlay fallback at step 1b
+# does the mounting. Say which path is in use instead of letting the log imply
+# that everything is Magisk-shaped (review F-001).
 if [ "$MANAGER" = "kernelsu" ]; then
-    log "manager: KernelSU этим модулем не поддержан (см. module.prop): правила и монтирование рассчитаны на Magisk/APatch"
+    log "manager: KernelSU — правила домена ksu, system/ монтируется запасным путём"
 fi
 
 PAGE_SIZE=$(getconf PAGE_SIZE 2>/dev/null || echo 4096)
@@ -63,18 +69,22 @@ fi
 
 log "=== km6fod: post-fs-data ==="
 
-# ------------------------------------------- 0. Take the vendor service offline
+# ---------------------------------------- 0. Vendor service: stop later, not now
 # init declares the vendor fingerprint provider as `class late_start`. If it
 # starts, it registers a HIDL fingerprint service, system_server builds a HIDL
 # sensor for it and the resulting client wedges the biometric scheduler. The
-# module supplies its own AIDL HAL instead, so the init service is disabled here
-# (post-fs-data runs before class late_start).
-for svc in vendor.tran_fps_hal vendor.fps_hal \
-           android.hardware.biometrics.fingerprint@2.1-service-mediatek; do
-    stop "$svc" 2>/dev/null
-    setprop "ctl.stop" "$svc" 2>/dev/null
-done
-log "vendor HIDL fp -> $(getprop init.svc.vendor.tran_fps_hal 2>/dev/null)"
+# module supplies its own AIDL HAL instead, so the init service is stopped - but
+# only in 3b, once the replacement is provably in place (review F-007). The stop
+# here or at the end of this script is the same race-free window: post-fs-data
+# runs before class late_start either way.
+stop_stock_fp() {
+    for svc in vendor.tran_fps_hal vendor.fps_hal \
+               android.hardware.biometrics.fingerprint@2.1-service-mediatek; do
+        stop "$svc" 2>/dev/null
+        setprop "ctl.stop" "$svc" 2>/dev/null
+    done
+    log "vendor HIDL fp -> $(getprop init.svc.vendor.tran_fps_hal 2>/dev/null)"
+}
 
 # --------------------------------------------------------------- 1. SELinux
 # The HAL runs from the Magisk late_start context and therefore inherits the
@@ -132,18 +142,63 @@ apply_rule "allow magisk hal_fingerprint_default fd use"
 apply_rule "allow magisk hal_fingerprint_default unix_stream_socket { read write getattr }"
 
 # ------------------------------------------------------------- 1b. Overlays
-# Static RROs must carry the system_file label or PackageManager skips them
-# without a word. KM6FpAidl clears config_biometric_sensors, which is what makes
-# AuthService take the AIDL branch instead of the legacy HIDL one.
-for apk in "$MODDIR"/system/product/overlay/*/*.apk; do
-    [ -f "$apk" ] || continue
-    chmod 0644 "$apk" 2>/dev/null
-    if chcon u:object_r:system_file:s0 "$apk" 2>/dev/null; then
-        log "overlay: ${apk##*/} labelled"
+# Static RROs must be scanned from a partition overlay directory and their files
+# must carry the system_file label, or PackageManager skips them without a word.
+# KM6FpAidl clears config_biometric_sensors, which is what makes AuthService take
+# the AIDL branch instead of the legacy HIDL one; KM6SuiUdfps supplies SystemUI's
+# pixel_pitch.
+#
+# Magisk and APatch mount system/ themselves, so the shipped tree is enough.
+# KernelSU mounts system/ only through a metamodule; when the APKs are not
+# visible the directory is layered with overlayfs instead: the stock overlays
+# stay in the lower half and ours live in an upper half under $RUN, so the 16 MB
+# of /product/overlay are never copied.
+OVERLAY_DIR=/system/product/overlay
+OVERLAY_OK=0
+OVERLAY_MOUNTED=0
+overlay_visible() {
+    total=0
+    visible=0
+    for apk in "$MODDIR"/system/product/overlay/*/*.apk; do
+        [ -f "$apk" ] || continue
+        rel=${apk#"$MODDIR"/system/product/overlay/}
+        total=$((total + 1))
+        [ -f "$OVERLAY_DIR/$rel" ] && visible=$((visible + 1))
+    done
+    [ "$total" -gt 0 ] && [ "$visible" -eq "$total" ]
+}
+if overlay_visible; then
+    OVERLAY_OK=1
+    log "overlay: RRO видны через system/ ($(ls "$MODDIR"/system/product/overlay/*/*.apk 2>/dev/null | wc -l) шт.)"
+elif [ "$MANAGER" = "magisk" ] || [ "$MANAGER" = "apatch" ]; then
+    # Magisk and APatch mount system/ themselves and do it after this script
+    # runs, so "not visible now" proves nothing there. The APKs are in the
+    # package; PackageManager scans /product/overlay much later.
+    OVERLAY_OK=1
+    log "overlay: system/ монтирует $MANAGER, RRO появятся до сканирования пакетов"
+else
+    upper="$RUN/overlay/upper"
+    work="$RUN/overlay/work"
+    rm -rf "$RUN/overlay" 2>/dev/null
+    mkdir -p "$upper" "$work" 2>/dev/null
+    for apk in "$MODDIR"/system/product/overlay/*/*.apk; do
+        [ -f "$apk" ] || continue
+        rel=${apk#"$MODDIR"/system/product/overlay/}
+        mkdir -p "$upper/${rel%/*}" 2>/dev/null
+        cp -f "$apk" "$upper/$rel" 2>/dev/null
+        chmod 0644 "$upper/$rel" 2>/dev/null
+        chcon u:object_r:system_file:s0 "$upper/$rel" 2>/dev/null
+    done
+    if mount -t overlay overlay \
+            -o "lowerdir=$OVERLAY_DIR,upperdir=$upper,workdir=$work" \
+            "$OVERLAY_DIR" 2>/dev/null && overlay_visible; then
+        OVERLAY_MOUNTED=1
+        OVERLAY_OK=1
+        log "overlay: RRO смонтированы overlayfs поверх $OVERLAY_DIR"
     else
-        log "overlay: ${apk##*/} НЕ ПОМЕЧЕН"
+        log "FATAL: overlay: RRO не видны и overlayfs не смонтировался — config_biometric_sensors останется непустым"
     fi
-done
+fi
 
 # --------------------------------------------------- 1c. Vendor namespace
 # A process executed from /data gets the "default" linker namespace, whose
@@ -479,10 +534,52 @@ if [ -f /vendor/etc/vintf/manifest.xml ] &&
     log "vintf: ВНИМАНИЕ: /vendor/etc/vintf/manifest.xml содержит fingerprint HAL"
 fi
 
-# The vendor HIDL provider opens /dev/silead_fp exclusively. Stop it before the
-# HAL starts; init may otherwise reacquire the node after our late_start.
-stop vendor.tran_fps_hal 2>/dev/null
-stop vendor.fps_hal 2>/dev/null
+# ------------------------------------------- 3b. Gate, then the switch (F-007)
+# Every step above can fail, and the vendor HIDL provider opens /dev/silead_fp
+# exclusively: if it is stopped while nothing replaces it, the device ends up
+# with no fingerprint provider at all. Stop it only when the replacement is
+# provably in place; otherwise take our mounts back, leave the stock service
+# alone and say so in the log.
+GATE=1
+grep -q " $VENDOR_FP " /proc/mounts 2>/dev/null || GATE=0
+grep -q " $VINTF_TARGET " /proc/mounts 2>/dev/null || GATE=0
+[ -s "$STAGE/fingerprint_aidl.xml" ] || GATE=0
+[ "$OVERLAY_OK" = "1" ] || GATE=0
+
+# A mount made in this script's namespace can be invisible to init and to the
+# framework. /proc/1 is the global namespace every consumer inherits, so a miss
+# there means the HAL would register where nobody looks and the RRO would never
+# be read (review F-001).
+global_mount() {
+    grep -Fq " $1 " /proc/1/mountinfo 2>/dev/null && return 0
+    log "FATAL: монтирование $1 не видно в глобальном namespace (pid 1)"
+    return 1
+}
+global_mount "$VENDOR_FP" || GATE=0
+global_mount "$VINTF_TARGET" || GATE=0
+
+# The HAL runs as root inside this same SELinux domain, and root bypasses DAC.
+# A denied access() therefore means the rules did not land, and the engine would
+# fail with HW_UNAVAILABLE without saying that policy was the reason (F-002).
+domain=$(cat /proc/self/attr/current 2>/dev/null | tr -d '\0')
+for node in /dev/mobicore-user /sys/kernel/tran_display/lcm_hbm_state; do
+    if [ -e "$node" ] && ! { [ -r "$node" ] && [ -w "$node" ]; }; then
+        log "FATAL: policy не применилась: $node недоступен в домене ${domain:-unknown}"
+        GATE=0
+    fi
+done
+
+if [ "$GATE" = "1" ]; then
+    stop_stock_fp
+    : > "$RUN/ready" 2>/dev/null
+    log "gate: подмена на месте, стоковый HIDL остановлен"
+else
+    rm -f "$RUN/ready" 2>/dev/null
+    [ "$OVERLAY_MOUNTED" = "1" ] && umount "$OVERLAY_DIR" 2>/dev/null
+    grep -q " $VINTF_TARGET " /proc/mounts 2>/dev/null && umount "$VINTF_TARGET" 2>/dev/null
+    grep -q " $VENDOR_FP " /proc/mounts 2>/dev/null && umount "$VENDOR_FP" 2>/dev/null
+    log "FATAL: подмена не на месте — монтирования сняты, стоковый fingerprint-провайдер оставлен работать"
+fi
 
 # ------------------------------------------------------------ 4. Permissions
 chmod 0755 "$MODDIR/files/fp_hal" 2>/dev/null

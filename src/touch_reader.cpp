@@ -402,6 +402,9 @@ void TouchReader::loop() {
             } else if (ev.type == EV_SYN && ev.code == SYN_DROPPED) {
                 // The kernel dropped events; the current tracking state is no
                 // longer trustworthy. Release the finger and resynchronise.
+                // Nothing used to log this, so a lost-touch report had no
+                // evidence behind it (review F-006).
+                LOGW("touch: SYN_DROPPED, releasing the finger and resynchronising");
                 tracking = false;
                 report_up();
             } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {

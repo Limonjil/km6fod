@@ -31,11 +31,6 @@ bash "$ROOT/build.sh"
 echo "== staging module payload"
 mkdir -p "$MODULE/files"
 cp -f "$ROOT/build/fp_hal" "$MODULE/files/fp_hal"
-if [ -f "$ROOT/patched/libsl_fp_impl.so" ]; then
-    echo "warning: patched/libsl_fp_impl.so is present but is no longer packaged;" >&2
-    echo "         the module now transforms the device's own library at boot." >&2
-fi
-rm -f "$MODULE/files/libsl_fp_impl.so"
 
 
 # Remove editor and runtime leftovers explicitly: the supervisor creates run/
@@ -76,9 +71,10 @@ MODE = {
     "post-fs-data.sh": 0o755,
     "service.sh": 0o755,
     "uninstall.sh": 0o755,
-    "wake_helper.sh": 0o755,
     "module.prop": 0o644,
     "sepolicy.rule": 0o644,
+    "sepolicy.rule.ksu": 0o644,
+    "customize.sh": 0o755,
     "vintf/fingerprint_aidl.xml": 0o644,
 }
 
