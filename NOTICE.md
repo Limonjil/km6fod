@@ -6,7 +6,8 @@ km6fod — clean-room AIDL fingerprint HAL for the Tecno Spark 40 Pro (KM6) on G
 
 Everything under `src/`, `tools/`, `magisk_module/*.sh`, `build.sh`, `build_module.sh`,
 `install.sh`, `overlay/*/AndroidManifest.xml` and `overlay/*/res/` is original work,
-licensed GPL-3.0-only (see the SPDX headers in `src/` and `LICENSE`).
+Copyright (C) 2026 limonjil, licensed GPL-3.0-only (see the SPDX headers in
+`src/` and the verbatim licence text in `LICENSE`).
 
 ## Third-party material in this tree
 

@@ -94,7 +94,7 @@ FOD_ARCHITECTURE_SPEC.md   как устроен вендорский движо
 
 ### Лицензия
 
-Код — **GPL-3.0-only**, см. `LICENSE`. Вендорские бинарники в
+Код — **GPL-3.0-only**, © 2026 limonjil, см. `LICENSE`. Вендорские бинарники в
 `magisk_module/files/` — собственность производителя, распространяются как есть.
 
 ---
@@ -182,6 +182,6 @@ FOD_ARCHITECTURE_SPEC.md   how the vendor engine and the HAL fit together
 
 ### License
 
-Code is **GPL-3.0-only**, see `LICENSE`. The vendor binaries in
+Code is **GPL-3.0-only**, © 2026 limonjil, see `LICENSE`. The vendor binaries in
 `magisk_module/files/` belong to their manufacturer and are redistributed
 as-is.
